@@ -43,16 +43,6 @@ from strategy import (
     applyborestriction,
     processnormal,
 )
-from gann_engine import (
-    calc_gann_levels_with_excel,
-    get_gann_row_from_json,
-    read_gann_levels_from_excel,
-    cut_dec,
-    GANN_EXCEL_PATH,
-    GANNEXCELPATH_MIDDAY,
-    GANN_TABLE,
-    GANN_MIDDAY_TABLE,
-)
 from smartapi_helpers import (
     # data helpers
     getindex1min,
@@ -104,24 +94,6 @@ import os
 # ===== Globals =====
 LAST_MANUAL_MONITOR_RUN: Optional[str] = None
 MANUAL_POSITIONS: Dict[str, list] = {}
-
-# ── RULE MODULE IMPORTS ──────────────────────────────────────────────────────
-
-
-# ===== PATCH: SmartApi internal logger ko safe bana do =====
-
-_smartapi_logger = smart_mod.logger
-
-
-class SmartApiSafeLogger(logging.LoggerAdapter):
-    def error(self, msg, *args, **kwargs):
-        try:
-            return super().error(msg, *args, **kwargs)
-        except Exception:
-            return _smartapi_logger.error(msg, *args, **kwargs)
-
-
-smart_mod.logger = SmartApiSafeLogger(_smartapi_logger, {})
 
 # ===== PATCH: SmartApi internal logger ko safe bana do =====
 
@@ -1135,148 +1107,38 @@ def run_v2_orb_gann_backtest_logic(
     high_vol_bo_candle = bo15_atr_info.get("ishighvol", False)
     high_vol_orb = high_vol_orb_range or high_vol_bo_candle
 
-    # -------- CHOTI: BO_15m / ORB ratio (MORNING ONLY) --------
-    is_choti_day = False
-    if orb_mode == "MORNING" and trigger_time is not None:
-        orb_range = marked_high - marked_low
+    (
+        is_choti_day,
+        orb_mode,
+        trigger_side,
+        trigger_time,
+        trigger_price,
+        marked_high,
+        marked_low,
+        boside_up_override,
+    ) = apply_choti_rule(
+        full_idxdf=full_idxdf,
+        orb_mode=orb_mode,
+        trigger_side=trigger_side,
+        trigger_time=trigger_time,
+        trigger_price=trigger_price,
+        marked_high=marked_high,
+        marked_low=marked_low,
+        bo15_atr_info=bo15_atr_info,
+    )
 
-        print("CHOTI-BO15-INFO", bo15_atr_info)
+    if orb_mode == "MIDDAY" and trigger_time is None:
+        orb_info = get_midday_orb_breakout_15min(full_idxdf)
+        if orb_info.get("status") != "ok":
+            return {"status": "CHOTI-MIDDAY-FAIL", "message": "No MIDDAY ORB after CHOTI"}
+        trigger_side = orb_info["trigger_side"]
+        trigger_time = orb_info["trigger_time"]
+        trigger_price = orb_info["trigger_price"]
+        marked_high = orb_info["marked_high"]
+        marked_low = orb_info["marked_low"]
 
-        # BO 15-min candle ka high/low/range safely nikaalo
-        bo_high = bo15_atr_info.get(
-            "bo15_high", bo15_atr_info.get("bo15high", 0.0))
-        bo_low = bo15_atr_info.get(
-            "bo15_low", bo15_atr_info.get("bo15low", 0.0))
-        bo_range = bo15_atr_info.get("bo15_range", bo_high - bo_low)
-
-        print(
-            "CHOTI-PRE-CHECK",
-            "mode", orb_mode,
-            "trigger_time", trigger_time,
-            "orb_range", orb_range,
-            "bo_range", bo_range,
-        )
-
-        if orb_range > 0 and bo_range > 0:
-            choti_ratio = bo_range / orb_range
-            is_choti_day = choti_ratio > 1.99
-
-            print(
-                "CHOTI-DEBUG",
-                "orb_high", marked_high,
-                "orb_low", marked_low,
-                "orb_range", orb_range,
-                "bo_high", bo_high,
-                "bo_low", bo_low,
-                "bo_range", bo_range,
-                "ratio", round(choti_ratio, 2),
-                "is_choti", is_choti_day,
-            )
-
-            if is_choti_day:
-                # 1) NEW ORB = breakout 15-min candle ka high/low
-                marked_high = bo_high
-                marked_low = bo_low
-
-                # 2) NEW BREAKOUT SEARCH: bo15 bucket ke baad se 12:00 tak (15-min close)
-                bo15_bucket_start = bo15_atr_info.get("bucket_start")
-                trade_date = full_idxdf.index[0].date()
-
-                if bo15_bucket_start is None and trigger_time is not None:
-                    bo15_bucket_start = trigger_time.replace(
-                        minute=(trigger_time.minute // 15) * 15,
-                        second=0,
-                        microsecond=0,
-                    )
-
-                new_mark_start = bo15_bucket_start + timedelta(minutes=15)
-                new_orb_end = datetime.combine(
-                    trade_date, datetime.strptime("12:00", "%H:%M").time()
-                )
-
-                # 1-min window
-                new_trigger_df = full_idxdf[
-                    (full_idxdf.index > new_mark_start)
-                    & (full_idxdf.index <= new_orb_end)
-                ]
-
-                # 15-min resample for breakout decision
-                new_trigger_15m = (
-                    new_trigger_df.resample("15min")
-                    .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
-                    .dropna()
-                )
-
-                new_trigger_time: Optional[datetime] = None
-                new_trigger_price: Optional[float] = None
-                new_trigger_side: Optional[str] = None
-
-                # DEBUG: print new ORB window and candles
-                print(
-                    "CHOTI-NEW-ORB-WINDOW",
-                    "start", new_mark_start,
-                    "end", new_orb_end,
-                    "marked_high", marked_high,
-                    "marked_low", marked_low,
-                )
-
-                # 15-min CLOSE-based breakout
-                for ts, row in new_trigger_15m.iterrows():
-                    close_price = float(row["close"])
-                    high_price = float(row["high"])
-                    low_price = float(row["low"])
-
-                    print("CHOTI-NEW-ORB-CHECK-15M", ts, "close", close_price)
-
-                    if new_trigger_side is None:
-                        # BUY BO: close breakout, CMP = 15-min HIGH
-                        if close_price > marked_high:
-                            new_trigger_side = "BUY"
-                            new_trigger_time = ts
-                            new_trigger_price = high_price  # BUY = HIGH
-                        # SELL BO: close breakout, CMP = 15-min LOW
-                        elif close_price < marked_low:
-                            new_trigger_side = "SELL"
-                            new_trigger_time = ts
-                            new_trigger_price = low_price   # SELL = LOW
-
-                if new_trigger_time is None:
-                    print("CHOTI-NEW-ORB NO BREAKOUT TILL 12:00, SHIFT TO MIDDAY")
-                    use_midday_orb_only = True
-                    orb_info = get_midday_orb_breakout_15min(full_idxdf)
-                    if orb_info.get("status") != "ok":
-                        return {
-                            "status": "CHOTI-MIDDAY-FAIL",
-                            "message": "No MIDDAY ORB after CHOTI",
-                        }
-
-                    orb_mode = "MIDDAY"
-                    trigger_side = orb_info["trigger_side"]
-                    trigger_time = orb_info["trigger_time"]
-                    trigger_price = orb_info["trigger_price"]
-                    marked_high = orb_info["marked_high"]
-                    marked_low = orb_info["marked_low"]
-                else:
-                    print(
-                        "CHOTI-NEW-ORB SUCCESS",
-                        "new_high", marked_high,
-                        "new_low", marked_low,
-                        "side", new_trigger_side,
-                        "time", new_trigger_time,
-                        "price", new_trigger_price,
-                    )
-
-                    trigger_side = new_trigger_side
-                    trigger_time = new_trigger_time
-                    trigger_price = new_trigger_price
-
-                    # CHOTI boside flip:
-                    # BUY trigger -> SELLBO primary (boside_up False)
-                    # SELL trigger -> BUYBO primary (boside_up True)
-                    if trigger_side == "BUY":
-                        boside_up = False
-                    elif trigger_side == "SELL":
-                        boside_up = True
+    if boside_up_override is not None:
+        boside_up = "BUYBO" if boside_up_override else "SELLBO"
 
     # -------- GANN CMP (decimal ignore) --------
     cmp_for_gann = int(trigger_price)
@@ -1601,24 +1463,6 @@ def run_v2_orb_gann_backtest_logic(
             primary = {"status": "NOENTRY"}
             primary_side = "BUY"
 
-        # -------- PRIMARY LEG (direction) --------
-    if boside_up == "BUYBO":
-        primary = buyresult
-        primary_side = "BUY"
-    elif boside_up == "SELLBO":
-        primary = sellresult
-        primary_side = "SELL"
-    else:
-        if buyresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
-            primary = buyresult
-            primary_side = "BUY"
-        elif sellresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
-            primary = sellresult
-            primary_side = "SELL"
-        else:
-            primary = {"status": "NOENTRY"}
-            primary_side = "BUY"
-
     # -------- DETAILED RESULT FIELDS FOR APP (NEW) --------
 
     # Breakout / ORB info
@@ -1738,27 +1582,6 @@ def run_v2_orb_gann_backtest_logic(
         "gann_details": gann_details,
         "rule_tags": rule_tags,
         "trade_details": trade_details,
-    }
-
-    return {
-        "status": "ok",
-        "account": acc.name,
-        "v1req": v1req,
-        "boside": boside,
-        "boside_up": boside_up,
-        "index_mode": index_mode,
-        "buyresult": buyresult,
-        "sellresult": sellresult,
-        "primary": primary,
-        "primary_side": primary_side,
-        "cestrike": cestrike,
-        "pestrike": pestrike,
-        "cetoken": None if index_mode else cetoken,
-        "petoken": None if index_mode else petoken,
-
-        # yeh 2 nayi fields add karo:
-        "is_choti_day": is_choti_day,
-        "orb_mode": orb_mode,
     }
 
 
