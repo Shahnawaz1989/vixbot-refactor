@@ -90,6 +90,7 @@ from jumpback_rule import decide_orb_or_jumpback
 import SmartApi.smartConnect as smart_mod
 from fastapi.responses import PlainTextResponse
 from price_rounding import round_index_price_for_side
+from bot3_high_vol_rule import run_bot3_entry_engine
 import os
 
 
@@ -975,6 +976,82 @@ def get_live_option_ltp(api: SmartConnect, token: str) -> float:
         return 0.0
 
 
+def get_nifty_daily_history_for_atr(api: SmartConnect, trade_date: str, lookback_days: int = 40) -> Optional[pd.DataFrame]:
+    """
+    NIFTY ka 1D OHLC history SmartAPI se laata hai,
+    ATR regime filter ke liye.
+    trade_date: "YYYY-MM-DD" (current test day)
+    """
+    try:
+        end_dt = datetime.strptime(trade_date, "%Y-%m-%d").date()
+        start_dt = end_dt - timedelta(days=lookback_days)
+
+        params = {
+            "exchange": "NSE",
+            "symboltoken": NIFTYINDEXTOKEN,  # 99926000
+            "interval": "ONE_DAY",
+            "fromdate": f"{start_dt} 09:15",
+            "todate": f"{end_dt} 15:30",
+        }
+        resp = api.getCandleData(params)
+
+        # YEH NAYA DEBUG PRINT
+        print("[ATR-DAILY-RAW]", resp.get("status"),
+              len(resp.get("data") or []))
+
+        if not resp.get("status") or not resp.get("data"):
+            print("[ATR-DAILY] No daily data for ATR regime:", resp)
+            return None
+
+        df = pd.DataFrame(
+            resp["data"],
+            columns=["timestamp", "open", "high", "low", "close", "volume"],
+        )
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["date"] = pd.to_datetime(df["timestamp"]).dt.date
+
+        # AUR YEH NAYA DEBUG PRINT
+        print("[ATR-DAILY-DF-TAIL]")
+        print(df[["date", "high", "low", "close"]].tail(5))
+
+        return df[["date", "open", "high", "low", "close"]]
+    except Exception as e:
+        print(f"[ATR-DAILY-ERROR] {e}")
+        return None
+
+
+def calculate_daily_atr_and_ratio(idxdf_daily, period=14):
+    """
+    idxdf_daily: daily NIFTY DF with columns: ['date','high','low','close']
+    Return: PREVIOUS TRADING DAY row with atr & ratio (current day nahi)
+    """
+    df = idxdf_daily.copy()
+
+    if df.empty:
+        return None
+
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(window=period).mean()
+    df['range'] = df['high'] - df['low']
+    df['ratio'] = df['range'] / df['atr']
+
+    df = df.dropna(subset=['ratio'])
+    if df.empty:
+        return None
+
+    # PREVIOUS TRADING DAY return karo (trade_date ke pehle wala)
+    if len(df) > 1:
+        return df.iloc[-2]  # second-last row
+    return df.iloc[-1]  # agar sirf ek row hai
+
+
 # ========= LIVE TRADE REQUEST + AUTO LIVE MODELS =========
 
 class SimpleVixConfig(BaseModel):
@@ -1030,6 +1107,55 @@ def run_v2_orb_gann_backtest_logic(
 
     nifty_idxdf.index = pd.to_datetime(nifty_idxdf.index)
     sensex_idxdf.index = pd.to_datetime(sensex_idxdf.index)
+
+    # -------- DAILY DF FROM 1-MIN (for ATR regime) --------
+    daily_df = (
+        nifty_idxdf
+        .resample("1D")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+        .dropna()
+        .reset_index()
+    )
+    daily_df = daily_df.rename(columns={"index": "date"})
+
+    prev_row_df = calculate_daily_atr_and_ratio(daily_df)
+
+    if prev_row_df is not None:
+        prev_ratio_df = float(prev_row_df["ratio"])
+        print(f"[ATR REGIME] prev HL/ATR = {prev_ratio_df:.2f}")
+        if prev_ratio_df > 1.4999:
+            print(
+                f"🚨 HIGH_VOL regime: prev day HL/ATR = {prev_ratio_df:.2f} → BOT-3 ONLY"
+            )
+            return run_bot3_high_vol_strategy(
+                idxdf_daily=daily_df,
+                idxdf_1min=nifty_idxdf,
+                trade_date=v1req.date,
+                gann_levels=bot3_gann_levels,
+            )
+    else:
+        print("[ATR REGIME] skip: insufficient daily data for ATR")
+
+    # -------- ATR REGIME USING DAILY HISTORY (NEW, OPTIONAL LOGGING) --------
+    daily_hist = get_nifty_daily_history_for_atr(api, v1req.date)
+    if daily_hist is None:
+        print("[ATR-REGIME-DAILY] daily_hist is None")
+    else:
+        print("[ATR-REGIME-DAILY] rows:", len(daily_hist))
+        prev_row_hist = calculate_daily_atr_and_ratio(daily_hist)
+        if prev_row_hist is not None:
+            prev_high = float(prev_row_hist["high"])
+            prev_low = float(prev_row_hist["low"])
+            prev_atr = float(prev_row_hist["atr"])
+            prev_range = prev_high - prev_low
+            prev_ratio_hist = float(prev_row_hist["ratio"])
+
+            print(
+                f"[ATR-REGIME-DAILY] prev_date={prev_row_hist['date']} "
+                f"range={prev_range:.2f} atr14={prev_atr:.2f} ratio={prev_ratio_hist:.2f}"
+            )
+        else:
+            print("[ATR-REGIME-DAILY] skip: insufficient daily history")
 
     # -------- PREVIOUS DAY HIGH/LOW --------
     prevdaydata = get_previous_day_high_low(api, v1req.date)
@@ -1312,6 +1438,47 @@ def run_v2_orb_gann_backtest_logic(
 
         v1req.buy.sl = cut_dec(levels["sell_entry"])
         v1req.sell.sl = cut_dec(levels["buy_entry"])
+
+    # -------- BOT-3 GANN LEVELS (H8/M8/N8/J8) --------
+    bot3_gann_levels = {
+        "H8": float(levels.get("H8", 0.0)),
+        "M8": float(levels.get("M8", 0.0)),
+        "N8": float(levels.get("N8", 0.0)),
+        "J8": float(levels.get("J8", 0.0)),
+    }
+
+    # -------- ATR REGIME USING DAILY HISTORY (NEW) --------
+    daily_hist = get_nifty_daily_history_for_atr(api, v1req.date)
+    if daily_hist is None:
+        print("[ATR-REGIME-DAILY] daily_hist is None")
+    else:
+        print("[ATR-REGIME-DAILY] rows:", len(daily_hist))
+
+    prev_row = calculate_daily_atr_and_ratio(
+        daily_hist) if daily_hist is not None else None
+
+    if prev_row is not None:
+        prev_high = float(prev_row["high"])
+        prev_low = float(prev_row["low"])
+        prev_atr = float(prev_row["atr"])
+        prev_range = prev_high - prev_low
+        prev_ratio = float(prev_row["ratio"])
+
+        print(
+            f"[ATR-REGIME-DAILY] prev_date={prev_row['date']} "
+            f"range={prev_range:.2f} atr14={prev_atr:.2f} ratio={prev_ratio:.2f}"
+        )
+
+        if prev_ratio > 1.4999:
+            print("🚨 HIGH_VOL regime → Bot-3 only")
+            return run_bot3_high_vol_strategy(
+                idxdf_daily=daily_hist,
+                idxdf_1min=nifty_idxdf,
+                trade_date=v1req.date,
+                gann_levels=bot3_gann_levels,
+            )
+    else:
+        print("[ATR-REGIME-DAILY] skip: insufficient daily history")
 
     # -------- ENTRY WINDOW + BOSTART FILTER --------
     trade_date2 = full_idxdf.index[0].date()
@@ -2143,7 +2310,54 @@ def run_915_orb_gann_backtest_logic(
     }
 
 
+# ===== BOT-3 HIGH VOL STRATEGY (NEW) =====
+
+
+def run_bot3_high_vol_strategy(idxdf_daily, idxdf_1min, trade_date, gann_levels: Dict[str, float]):
+    """
+    HIGH_VOL (prev day HL/ATR > 1.4999) ke liye special Bot-3.
+    Yahan se bot3_high_vol_rule.py ka main engine call hoga.
+    """
+    prev_row = calculate_daily_atr_and_ratio(idxdf_daily)
+    ratio = float(prev_row["ratio"]) if prev_row is not None else None
+    print(f"[BOT3] ACTIVE for {trade_date}, prev_ratio={ratio}")
+
+    # 1-min -> 15-min
+    idx15 = (
+        idxdf_1min
+        .resample("15min")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+        .dropna()
+    )
+
+    # 15-min ATR(14) calculate karo
+    high_low = idx15["high"] - idx15["low"]
+    high_close = (idx15["high"] - idx15["close"].shift()).abs()
+    low_close = (idx15["low"] - idx15["close"].shift()).abs()
+    tr15 = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr15 = tr15.rolling(window=14).mean()
+
+    # 9:15 candle ka ATR approx: first non-NaN ATR value
+    atr_series = atr15.dropna()
+    atr15_at_915 = float(atr_series.iloc[0]) if not atr_series.empty else 0.0
+    print(f"[BOT3-ATR-15M] atr15_at_915={atr15_at_915:.2f}")
+
+    bot3_result = run_bot3_entry_engine(
+        idx1m=idxdf_1min,
+        idx15=idx15,
+        atr15_at_915=atr15_at_915,
+        gann_levels=gann_levels,
+    )
+
+    return {
+        "status": bot3_result.get("status", "BOT3_PENDING"),
+        "regime_ratio": ratio,
+        "details": bot3_result,
+    }
+
+
 # ===== SIMPLE LIVE HELPERS (ENTRY/EXIT) =====
+
 
 def get_live_option_ltp(api, token: str) -> float:
     """SmartAPI se current LTP lao (simple version)."""
