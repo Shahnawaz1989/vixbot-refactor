@@ -2,6 +2,7 @@
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
+from price_rounding import round_index_price_for_side
 
 
 def detect_orb_atr_ratio(nifty_idxdf: pd.DataFrame, atr_14: float) -> Dict[str, Any]:
@@ -113,12 +114,15 @@ def detectbreakout15matrratio(
     return result
 
 
+# ensure import hai
+
+
 def get_marking_and_trigger(idxdf: pd.DataFrame) -> Dict[str, Any]:
     """
     10:00–10:15 candle HIGH/LOW mark karo.
     10:15–12:30 window me 15-min close-based breakout detect karo.
-    BUY BO  → trigger_price = 15-min candle HIGH
-    SELL BO → trigger_price = 15-min candle LOW
+    BUY BO  -> trigger_price = rounded buy trigger (ceil to next int)
+    SELL BO -> trigger_price = rounded sell trigger (floor to int)
     """
     if idxdf.empty:
         return {"status": "error", "message": "Empty index DF"}
@@ -133,11 +137,14 @@ def get_marking_and_trigger(idxdf: pd.DataFrame) -> Dict[str, Any]:
 
     trade_date = idxdf.index[0].date()
     mark_start = datetime.combine(
-        trade_date, datetime.strptime("10:00", "%H:%M").time())
+        trade_date, datetime.strptime("10:00", "%H:%M").time()
+    )
     mark_end = datetime.combine(
-        trade_date, datetime.strptime("10:15", "%H:%M").time())
+        trade_date, datetime.strptime("10:15", "%H:%M").time()
+    )
     orb_window_end = datetime.combine(
-        trade_date, datetime.strptime("12:30", "%H:%M").time())
+        trade_date, datetime.strptime("12:30", "%H:%M").time()
+    )
 
     marking = idxdf[(idxdf.index >= mark_start) & (idxdf.index < mark_end)]
     if marking.empty:
@@ -145,6 +152,10 @@ def get_marking_and_trigger(idxdf: pd.DataFrame) -> Dict[str, Any]:
 
     marked_high = float(marking["high"].max())
     marked_low = float(marking["low"].min())
+
+    # NIFTY index ke rounded trigger levels
+    rounded_buy_trigger = round_index_price_for_side(marked_high, "BUY")
+    rounded_sell_trigger = round_index_price_for_side(marked_low, "SELL")
 
     trigger_df = idxdf[(idxdf.index >= mark_end) &
                        (idxdf.index <= orb_window_end)]
@@ -164,25 +175,33 @@ def get_marking_and_trigger(idxdf: pd.DataFrame) -> Dict[str, Any]:
         high_price = float(row["high"])
         low_price = float(row["low"])
         print(
-            f"ORB-15M-CHECK {ts} close {close_price} high {high_price} low {low_price}")
+            f"ORB-15M-CHECK {ts} close {close_price} high {high_price} low {low_price}"
+        )
 
-        if close_price > marked_high:
+        # BUY breakout: close must reach rounded_buy_trigger
+        if close_price >= rounded_buy_trigger:
+            # trigger_price = breakout candle ka CLOSE
+            rounded_trigger = round_index_price_for_side(close_price, "BUY")
             return {
-                "status":       "ok",
-                "trigger_side":  "BUY",
-                "trigger_time":  ts,
-                "trigger_price": high_price,
-                "marked_high":   marked_high,
-                "marked_low":    marked_low,
+                "status": "ok",
+                "trigger_side": "BUY",
+                "trigger_time": ts,
+                "trigger_price": rounded_trigger,
+                "marked_high": marked_high,
+                "marked_low": marked_low,
             }
-        if close_price < marked_low:
+
+        # SELL breakout: close must reach rounded_sell_trigger
+        if close_price <= rounded_sell_trigger:
+            # trigger_price = breakout candle ka CLOSE
+            rounded_trigger = round_index_price_for_side(close_price, "SELL")
             return {
-                "status":       "ok",
-                "trigger_side":  "SELL",
-                "trigger_time":  ts,
-                "trigger_price": low_price,
-                "marked_high":   marked_high,
-                "marked_low":    marked_low,
+                "status": "ok",
+                "trigger_side": "SELL",
+                "trigger_time": ts,
+                "trigger_price": rounded_trigger,
+                "marked_high": marked_high,
+                "marked_low": marked_low,
             }
 
     return {

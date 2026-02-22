@@ -86,8 +86,10 @@ import pyotp
 from SmartApi import SmartConnect
 from SmartApi import smartConnect as smart_module
 import logging
+from jumpback_rule import decide_orb_or_jumpback
 import SmartApi.smartConnect as smart_mod
 from fastapi.responses import PlainTextResponse
+from price_rounding import round_index_price_for_side
 import os
 
 
@@ -707,6 +709,17 @@ def vixbacktest(req: VixV2Request) -> Dict[str, Any]:
     # Single source of truth: full engine yahin se chalega
     result = run_v2_orb_gann_backtest_logic(api, fake_acc, v1req)
 
+    if result.get("status") == "JUMP_TO_915_ORB":
+        jump_decision_time = result.get("jump_decision_time")
+        print("[V2-ENDPOINT] Switching to 9:15 ORB bot, fallback_after_time=",
+              jump_decision_time)
+        result = run_915_orb_gann_backtest_logic(
+            api,
+            fake_acc,
+            v1req,
+            fallback_after_time=jump_decision_time,
+        )
+
     return result
 
 
@@ -1004,9 +1017,9 @@ def run_v2_orb_gann_backtest_logic(
     v1req: VixRequest,
 ) -> Dict[str, Any]:
     """
-    Ye function purane /v2/live-trade ke andar ka pura backtest + decision logic chalata hai,
-    bas SmartAPI order placement ya HTTPResponse nahi banata.
-    Isko hum endpoint se bhi call karenge aur auto-live se bhi.
+    10:00 ORB + Gann backtest logic.
+    Agar 10:00 ORB breakout ke waqt tak previous day H/L break nahi hua,
+    to yeh bot trade nahi lega, status = JUMP_TO_915_ORB dega.
     """
 
     # -------- NIFTY + SENSEX 1-min DATA --------
@@ -1064,6 +1077,12 @@ def run_v2_orb_gann_backtest_logic(
     prev_break_till_1330 = check_breakout(idx_till_1330, prevhigh, prevlow)
     prev_break_flag_1330 = bool(prev_break_till_1330.get("breakout"))
 
+    print(
+        "[PREV-DAY-1330]",
+        "break_flag=", prev_break_flag_1330,
+        "break_info=", prev_break_till_1330,
+    )
+
     # -------- PREV DAY 15-MIN BREAKOUT --------
     idx15 = full_idxdf.resample("15min").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last"}
@@ -1075,17 +1094,14 @@ def run_v2_orb_gann_backtest_logic(
     breakout_price = breakout_result.get("breakoutprice")
 
     # -------- MID-DAY FORCE FLAG (RULE 2) --------
+    # Ab 13:30 wala flag sirf info ke liye hai, MIDDAY force nahi kar rahe
     use_midday_orb_only = False
-    if not prev_break_flag_1330:
-        use_midday_orb_only = True
 
     # -------- 10:00–10:15 ORB + MID-DAY FALLBACK --------
-    orb_info = get_marking_and_trigger(
-        full_idxdf)  # NEW 15-min + HIGH/LOW logic
+    orb_info = get_marking_and_trigger(full_idxdf)
     if orb_info["status"] == "ok" and not use_midday_orb_only:
         orb_mode = "MORNING"
     else:
-        # MID-DAY ORB variant, same 15-min + HIGH/LOW style
         orb_info = get_midday_orb_breakout_15min(full_idxdf)
         if orb_info["status"] != "ok":
             return {
@@ -1102,9 +1118,65 @@ def run_v2_orb_gann_backtest_logic(
     marked_high = orb_info["marked_high"]
     marked_low = orb_info["marked_low"]
 
+    # ====== JUMP BACK DECISION ON 10:00 ORB ======
+    if orb_mode == "MORNING" and trigger_time is not None:
+        jb = decide_orb_or_jumpback(
+            full_idxdf=full_idxdf,
+            prev_high=prevhigh,
+            prev_low=prevlow,
+            orb_break_time=trigger_time,
+        )
+        print(
+            "[JUMPBACK-DECISION]",
+            "mode=", jb["mode"],
+            "reason=", jb["reason"],
+        )
+
+        if jb["mode"] == "JUMP_BACK":
+            # Bot-1 ka decision time ko next 15-min bucket pe round karo
+            dt = trigger_time
+            minute_bucket = (dt.minute // 15 + 1) * 15
+            if minute_bucket >= 60:
+                dt = dt.replace(hour=dt.hour + 1, minute=0,
+                                second=0, microsecond=0)
+            else:
+                dt = dt.replace(minute=minute_bucket, second=0, microsecond=0)
+
+            fb_str = dt.strftime("%H:%M")
+
+            print(
+                "[MAIN-ORB-JUMP-BACK]",
+                "10:00 ORB breakout ke waqt prev day HL nahi toota, "
+                "is bot me trade nahi lenge",
+            )
+            return {
+                "status": "JUMP_TO_915_ORB",
+                "message": (
+                    "10:00 ORB breakout ke waqt prev day H/L break nahi hua, "
+                    "9:15 ORB bot use karo"
+                ),
+                "date": str(v1req.date),
+                "prev_high": float(prevhigh),
+                "prev_low": float(prevlow),
+                "ten_am_orb_marked_high": float(marked_high),
+                "ten_am_orb_marked_low": float(marked_low),
+                "jump_orb_high": float(jb["jump_orb_high"]),
+                "jump_orb_low": float(jb["jump_orb_low"]),
+                "jump_break_time": str(jb["jump_break_time"]),
+                "jump_break_dir": jb["jump_break_dir"],
+                # Bot-1 ka decision time (rounded to next 15-min candle)
+                "jump_decision_time": fb_str,
+            }
+        else:
+            print(
+                "[MAIN-ORB-OK]",
+                "Using 10:00 ORB breakout (prev day HL already broken before ORB)",
+            )
+    # ====== END JUMP BACK DECISION ======
+
     # -------- BREAKOUT 15-MIN CANDLE / ATR14 RATIO --------
     bo15_atr_info = detectbreakout15matrratio(idx15, trigger_time, atr14)
-    high_vol_bo_candle = bo15_atr_info.get("ishighvol", False)
+    high_vol_bo_candle = bo15_atr_info.get("is_high_vol", False)
     high_vol_orb = high_vol_orb_range or high_vol_bo_candle
 
     (
@@ -1130,7 +1202,10 @@ def run_v2_orb_gann_backtest_logic(
     if orb_mode == "MIDDAY" and trigger_time is None:
         orb_info = get_midday_orb_breakout_15min(full_idxdf)
         if orb_info.get("status") != "ok":
-            return {"status": "CHOTI-MIDDAY-FAIL", "message": "No MIDDAY ORB after CHOTI"}
+            return {
+                "status": "CHOTI-MIDDAY-FAIL",
+                "message": "No MIDDAY ORB after CHOTI",
+            }
         trigger_side = orb_info["trigger_side"]
         trigger_time = orb_info["trigger_time"]
         trigger_price = orb_info["trigger_price"]
@@ -1239,30 +1314,23 @@ def run_v2_orb_gann_backtest_logic(
         v1req.sell.sl = cut_dec(levels["buy_entry"])
 
     # -------- ENTRY WINDOW + BOSTART FILTER --------
-
-    # Breakout ke 15 min baad se hi search
     trade_date2 = full_idxdf.index[0].date()
 
-    # Breakout ke 15 min baad se hi search (default)
     if trigger_time is not None:
         entry_start_time = trigger_time + timedelta(minutes=15)
     else:
-        # fallback: 10:15
         entry_start_time = datetime.combine(
             trade_date2, datetime.strptime("10:15", "%H:%M").time()
         )
 
-    # MIDDAY ORB ke liye hard-coded fixed start time (e.g. 13:30)
     if orb_mode == "MIDDAY":
         entry_start_time = get_midday_entry_start(trade_date2)
 
-    # Base DF from entry_start_time (NO 13:45 clamp)
     base_idxdf = full_idxdf[full_idxdf.index >= entry_start_time].copy()
 
     # -------- CHOTI DAY ENTRY WINDOWS (2h / 1h) --------
     if orb_mode == "MORNING" and is_choti_day and trigger_time is not None:
-        timer_start = trigger_time  # 15-min candle close time
-        # default 2h
+        timer_start = trigger_time
         buy_window_end = timer_start + timedelta(hours=2)
         sell_window_end = timer_start + timedelta(hours=2)
 
@@ -1290,7 +1358,6 @@ def run_v2_orb_gann_backtest_logic(
             "sell_end=", sell_window_end,
         )
     else:
-        # Normal day: both legs full base_idxdf
         idxdf_buy_window = base_idxdf.copy()
         idxdf_sell_window = base_idxdf.copy()
 
@@ -1330,7 +1397,6 @@ def run_v2_orb_gann_backtest_logic(
         "selltime=", getattr(sellentrycandle, "name", None),
     )
 
-    # CHOTI: agar dono side pe entry nahi mili window ke andar -> morning invalid
     if orb_mode == "MORNING" and is_choti_day:
         if buyentrycandle is None and sellentrycandle is None:
             return {
@@ -1464,11 +1530,8 @@ def run_v2_orb_gann_backtest_logic(
             primary_side = "BUY"
 
     # -------- DETAILED RESULT FIELDS FOR APP (NEW) --------
-
-    # Breakout / ORB info
     breakout_details: Dict[str, Any] = {
-        # MORNING / MIDDAY context
-        "orb_mode": orb_mode,  # "MORNING" or "MIDDAY"
+        "orb_mode": orb_mode,
         "trigger_side": trigger_side,
         "trigger_time": trigger_time.strftime("%H:%M") if trigger_time else None,
         "trigger_price": float(trigger_price) if trigger_price is not None else None,
@@ -1478,10 +1541,8 @@ def run_v2_orb_gann_backtest_logic(
         "use_midday_orb_only": use_midday_orb_only,
     }
 
-    # CHOTI specific metadata
     if is_choti_day:
         breakout_details["choti_reason"] = "BO15/ORB range ratio > 1.99"
-        # NEW ORB high/low already in marked_high/marked_low
         if use_midday_orb_only:
             breakout_details[
                 "shift_reason"
@@ -1489,10 +1550,9 @@ def run_v2_orb_gann_backtest_logic(
         else:
             breakout_details["shift_reason"] = "CHOTI-NEW-ORB 15-min close breakout"
 
-    # Gann mapping snapshot (CMP + levels from v1req after mapping)
     gann_details: Dict[str, Any] = {
         "cmp_at_trigger": int(trigger_price) if trigger_price is not None else None,
-        "gann_rule": rule,  # "ATR_NORMAL" / "HALF_GAP"
+        "gann_rule": rule,
         "high_vol_orb": high_vol_orb,
         "excel_mode": "MIDDAY" if orb_mode == "MIDDAY" else "MORNING",
         "buy": {
@@ -1509,7 +1569,6 @@ def run_v2_orb_gann_backtest_logic(
         },
     }
 
-    # Rule tags list for UI (chips)
     rule_tags: List[str] = []
     if is_choti_day:
         rule_tags.append("CHOTI_DAY")
@@ -1522,7 +1581,12 @@ def run_v2_orb_gann_backtest_logic(
     if high_vol_orb:
         rule_tags.append("HIGH_VOL_ORB")
 
-    # Primary leg entry/exit compact view
+    POINT_VALUE_INDEX = 65
+    try:
+        qty_lots = v1req.lots
+    except AttributeError:
+        qty_lots = v1req.get("lots", 1)
+
     primary_entry_time: Optional[str] = None
     primary_entry_price: Optional[float] = None
     primary_exit_time: Optional[str] = None
@@ -1530,22 +1594,53 @@ def run_v2_orb_gann_backtest_logic(
     primary_exit_reason: Optional[str] = None
     primary_pnl: Optional[float] = None
 
-    if primary_side == "BUY" and buyresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
-        primary_entry_time = buyresult.get("entrytime")
-        primary_entry_price = float(buyresult.get("entryindex", 0.0))
-        primary_exit_time = buyresult.get("exittime")
-        primary_exit_price = float(buyresult.get("exitindex", 0.0)) if buyresult.get(
-            "exitindex") is not None else None
-        primary_exit_reason = buyresult.get("exitreason")
-        primary_pnl = float(buyresult.get("pnl", 0.0))
-    elif primary_side == "SELL" and sellresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
-        primary_entry_time = sellresult.get("entrytime")
-        primary_entry_price = float(sellresult.get("entryindex", 0.0))
-        primary_exit_time = sellresult.get("exittime")
-        primary_exit_price = float(sellresult.get("exitindex", 0.0)) if sellresult.get(
-            "exitindex") is not None else None
-        primary_exit_reason = sellresult.get("exitreason")
-        primary_pnl = float(sellresult.get("pnl", 0.0))
+    if index_mode:
+        if primary_side == "BUY" and buyresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
+            primary_entry_time = buyresult.get("entrytime")
+            primary_entry_price = float(buyresult.get("entryindex", 0.0))
+            primary_exit_time = buyresult.get("exittime")
+            primary_exit_price = float(buyresult.get("exitindex", 0.0)) if buyresult.get(
+                "exitindex"
+            ) is not None else None
+            primary_exit_reason = buyresult.get("exitreason")
+
+            if primary_exit_price is not None:
+                points = primary_exit_price - primary_entry_price
+                primary_pnl = points * POINT_VALUE_INDEX * qty_lots
+
+        elif primary_side == "SELL" and sellresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
+            primary_entry_time = sellresult.get("entrytime")
+            primary_entry_price = float(sellresult.get("entryindex", 0.0))
+            primary_exit_time = sellresult.get("exittime")
+            primary_exit_price = float(sellresult.get("exitindex", 0.0)) if sellresult.get(
+                "exitindex"
+            ) is not None else None
+            primary_exit_reason = sellresult.get("exitreason")
+
+            if primary_exit_price is not None:
+                points = primary_entry_price - primary_exit_price
+                primary_pnl = points * POINT_VALUE_INDEX * qty_lots
+
+    else:
+        if primary_side == "BUY" and buyresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
+            primary_entry_time = buyresult.get("entrytime")
+            primary_entry_price = float(buyresult.get("entryindex", 0.0))
+            primary_exit_time = buyresult.get("exittime")
+            primary_exit_price = float(buyresult.get("exitindex", 0.0)) if buyresult.get(
+                "exitindex"
+            ) is not None else None
+            primary_exit_reason = buyresult.get("exitreason")
+            primary_pnl = float(buyresult.get("pnl", 0.0))
+
+        elif primary_side == "SELL" and sellresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
+            primary_entry_time = sellresult.get("entrytime")
+            primary_entry_price = float(sellresult.get("entryindex", 0.0))
+            primary_exit_time = sellresult.get("exittime")
+            primary_exit_price = float(sellresult.get("exitindex", 0.0)) if sellresult.get(
+                "exitindex"
+            ) is not None else None
+            primary_exit_reason = sellresult.get("exitreason")
+            primary_pnl = float(sellresult.get("pnl", 0.0))
 
     trade_details: Dict[str, Any] = {
         "primary_side": primary_side,
@@ -1572,12 +1667,475 @@ def run_v2_orb_gann_backtest_logic(
         "pestrike": pestrike,
         "cetoken": None if index_mode else cetoken,
         "petoken": None if index_mode else petoken,
-
-        # existing:
         "is_choti_day": is_choti_day,
         "orb_mode": orb_mode,
+        "breakout_details": breakout_details,
+        "gann_details": gann_details,
+        "rule_tags": rule_tags,
+        "trade_details": trade_details,
+    }
 
-        # NEW:
+
+def run_915_orb_gann_backtest_logic(
+    api,
+    acc,
+    v1req: VixRequest,
+    fallback_after_time: Optional[str] = None,  # "HH:MM" -> bot-1 JUMP time
+) -> Dict[str, Any]:
+    """
+    9:15–9:30 ORB based Gann bot:
+    - 9:15 ki 15-min ORB mark
+    - us ORB ka 15-min close-based breakout (09:30 se aage)
+    - Gann + HALF_GAP / ATR_NORMAL mapping same as 10AM bot
+    - CHOTI & 10:00 ORB rules yahan nahi lagenge
+    """
+
+    # -------- NIFTY 1-min DATA --------
+    nifty_idxdf = getindex1min(api, v1req.date, symboltoken=NIFTYINDEXTOKEN)
+    if nifty_idxdf.empty:
+        return {"status": "error", "message": "No NIFTY data"}
+
+    nifty_idxdf.index = pd.to_datetime(nifty_idxdf.index)
+    full_idxdf = nifty_idxdf.copy()
+
+    # -------- HALF GAP + ATR14 (Angel) --------
+    half_gap = detect_half_gap(api, full_idxdf, v1req.date)
+    atr14 = float(half_gap.get("atr_14") or 0.0)
+    is_half_gap = half_gap.get("is_half_gap", False)
+    half_gap_type = half_gap.get("half_gap_type")
+
+    # 9:15 bot pe HALF_GAP day invalid
+    if is_half_gap:
+        return {
+            "status": "INVALID_915_HALF_GAP",
+            "message": "9:15 ORB bot disabled on HALF-GAP day, trade mat dekh (jaise 30 JAN 2026).",
+            "half_gap_type": half_gap_type,
+            "atr_14": atr14,
+        }
+
+    # -------- 9:15–9:30 ORB MARKING (15-min) --------
+    trade_date = full_idxdf.index[0].date()
+    start_915 = datetime.combine(
+        trade_date, datetime.strptime("09:15", "%H:%M").time()
+    )
+    end_930 = datetime.combine(
+        trade_date, datetime.strptime("09:30", "%H:%M").time()
+    )
+
+    orb_915 = full_idxdf[(full_idxdf.index >= start_915)
+                         & (full_idxdf.index < end_930)]
+    if orb_915.empty:
+        return {"status": "error", "message": "No 9:15–9:30 data"}
+
+    marked_high = float(orb_915["high"].max())
+    marked_low = float(orb_915["low"].min())
+
+    print(
+        "[915-ORB-MARK]",
+        "high=", marked_high,
+        "low=", marked_low,
+    )
+
+    # -------- 15-MIN CLOSE-BASED BREAKOUT (from 09:30 onwards) --------
+    trigger_window = full_idxdf[full_idxdf.index >= end_930]
+    if trigger_window.empty:
+        return {
+            "status": "NO_TRIGGER_WINDOW_915",
+            "message": "No data after 9:30 for 9:15 ORB breakout",
+            "marked_high": marked_high,
+            "marked_low": marked_low,
+        }
+
+    agg_dict = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    trigger_df15m = trigger_window.resample("15min").agg(agg_dict).dropna()
+
+    trigger_side = None
+    trigger_time = None
+    trigger_price = None
+
+    for ts, row in trigger_df15m.iterrows():
+        close_price = float(row["close"])
+        high_price = float(row["high"])
+        low_price = float(row["low"])
+        print(
+            f"[915-ORB-15M-CHECK] {ts} close {close_price} high {high_price} low {low_price}"
+        )
+
+        if close_price > marked_high:
+            trigger_side = "BUY"
+            trigger_time = ts
+            trigger_price = round_index_price_for_side(close_price, "BUY")
+            break
+
+        if close_price < marked_low:
+            trigger_side = "SELL"
+            trigger_time = ts
+            trigger_price = round_index_price_for_side(close_price, "SELL")
+            break
+
+    if trigger_time is None:
+        return {
+            "status": "NO_BREAK_915_ORB",
+            "message": "No 9:15 ORB 15-min close breakout till end of window",
+            "marked_high": marked_high,
+            "marked_low": marked_low,
+        }
+
+    print(
+        "[915-ORB-BREAK]",
+        "time=", trigger_time,
+        "side=", trigger_side,
+        "trigger_price=", trigger_price,
+    )
+
+    # -------- RULE TAGGING --------
+    rule = "ATR_NORMAL"
+    # (HALF_GAP yahan kabhi true nahi aayega, upar hi exit kar rahe)
+
+    # -------- GANN CMP (decimal ignore) --------
+    cmp_for_gann = int(trigger_price)
+    orb_mode = "ORB_915"  # UI ke liye tag
+
+    # MORNING Excel hi use hoga
+    excel_path = GANN_EXCEL_PATH
+
+    try:
+        levels = calc_gann_levels_with_excel(
+            cmp_for_gann, side=trigger_side, excel_path=excel_path
+        )
+    except Exception as e:
+        return {"status": "error", "message": f"GANN Excel error (915 ORB): {e}"}
+
+    # -------- HIGH-VOL FLAG (simple) --------
+    high_vol_orb = False
+
+    # -------- GANN MAPPING (ATR_NORMAL only) --------
+    atr14_local = half_gap.get("atr_14", 0.0) or half_gap.get("atr14", 0.0)
+
+    def pick_buy_t4_from_atr(base_entry: float) -> float:
+        if atr14_local <= 0:
+            return cut_dec(levels["buy_t4"])
+        raw_target = base_entry + 2 * atr14_local
+        candidates = [
+            levels["buy_t2"],
+            levels["buy_t25"],
+            levels["buy_t3"],
+            levels["buy_t35"],
+            levels["buy_t4"],
+        ]
+        below = [x for x in candidates if x <= raw_target]
+        return cut_dec(max(below) if below else max(candidates))
+
+    def pick_sell_t4_from_atr(base_entry: float) -> float:
+        if atr14_local <= 0:
+            return cut_dec(levels["sell_t4"])
+        raw_target = base_entry - 2 * atr14_local
+        candidates = [
+            levels["sell_t2"],
+            levels["sell_t25"],
+            levels["sell_t3"],
+            levels["sell_t35"],
+            levels["sell_t4"],
+        ]
+        above = [x for x in candidates if x >= raw_target]
+        return cut_dec(min(above) if above else min(candidates))
+
+    if trigger_side == "BUY":
+        v1req.buy.level = cut_dec(levels["buy_entry"])
+        v1req.buy.t2 = cut_dec(levels["buy_t2"])
+        v1req.buy.t4 = pick_buy_t4_from_atr(v1req.buy.level)
+
+        v1req.sell.level = cut_dec(levels["sell_entry"])
+        v1req.sell.t2 = cut_dec(levels["sell_t2"])
+        v1req.sell.t4 = pick_sell_t4_from_atr(v1req.sell.level)
+    else:
+        v1req.sell.level = cut_dec(levels["sell_entry"])
+        v1req.sell.t2 = cut_dec(levels["sell_t2"])
+        v1req.sell.t4 = pick_sell_t4_from_atr(v1req.sell.level)
+
+        v1req.buy.level = cut_dec(levels["buy_entry"])
+        v1req.buy.t2 = cut_dec(levels["buy_t2"])
+        v1req.buy.t4 = pick_buy_t4_from_atr(v1req.buy.level)
+
+    v1req.buy.sl = cut_dec(levels["sell_entry"])
+    v1req.sell.sl = cut_dec(levels["buy_entry"])
+
+    # -------- ENTRY WINDOW + BOSTART (no CHOTI) --------
+    trade_date2 = full_idxdf.index[0].date()
+
+    # Breakout ke 15 min baad
+    logical_start = trigger_time + timedelta(minutes=15)
+
+    # Fallback: bot-1 JUMP ke baad hi entry search start
+    if fallback_after_time:
+        fb_dt = datetime.combine(
+            trade_date2,
+            datetime.strptime(fallback_after_time, "%H:%M").time(),
+        )
+        entry_start_time = max(logical_start, fb_dt)
+    else:
+        entry_start_time = logical_start
+
+    base_idxdf = full_idxdf[full_idxdf.index >= entry_start_time].copy()
+
+    idxdf_buy_window = base_idxdf.copy()
+    idxdf_sell_window = base_idxdf.copy()
+
+    bot = DEFAULTBOSTART
+    starttime = datetime.combine(base_idxdf.index[0].date(), bot)
+    idxdf_buy_window = idxdf_buy_window[idxdf_buy_window.index >= starttime]
+    idxdf_sell_window = idxdf_sell_window[idxdf_sell_window.index >= starttime]
+
+    # -------- INDEX MODE --------
+    expiry_up = (v1req.expiry or "").upper()
+    index_mode = expiry_up == "INDEX"
+
+    # -------- BOSIDE NORMALISATION --------
+    rawboside = (v1req.boside or "").upper()
+    rawboside_clean = rawboside.replace("_", "")
+    if rawboside_clean in ("BUY", "BUYBO"):
+        boside = "BUYBO"
+    elif rawboside_clean in ("SELL", "SELLBO"):
+        boside = "SELLBO"
+    else:
+        boside = "BUYBO"
+    boside_up = boside.upper()
+
+    buyentrylevel = v1req.buy.level
+    sellentrylevel = v1req.sell.level
+
+    # -------- BO RESTRICTION + ENTRY CANDLES --------
+    idxdfbuy = applyborestriction(idxdf_buy_window, v1req, legside="BUYBO")
+    idxdfsell = applyborestriction(idxdf_sell_window, v1req, legside="SELLBO")
+    buyentrycandle = findentryidx(idxdfbuy, buyentrylevel)
+    sellentrycandle = findentryidx(idxdfsell, sellentrylevel)
+    print(
+        "[915-ENTRY-RESULT]",
+        "buytime=", getattr(buyentrycandle, "name", None),
+        "selltime=", getattr(sellentrycandle, "name", None),
+    )
+
+    buyresult: Dict[str, Any] = {"status": "NOENTRY"}
+    sellresult: Dict[str, Any] = {"status": "NOENTRY"}
+    lots = v1req.lots or 1
+
+    # -------- OPTION / INDEX DATA SELECT --------
+    if not index_mode:
+        ce_raw = v1req.buy.level
+        pe_raw = v1req.sell.level
+
+        def round_to_nearest_50(x: float) -> int:
+            return int(round(x / 50.0) * 50)
+
+        cestrike = round_to_nearest_50(ce_raw)
+        pestrike = round_to_nearest_50(pe_raw)
+
+        cetoken = getoptiontoken(cestrike, v1req.expiry, "CE")
+        petoken = getoptiontoken(pestrike, "PE", v1req.expiry)
+    else:
+        cestrike = 0
+        pestrike = 0
+        cetoken = None
+        petoken = None
+
+    if not index_mode:
+        ceoptdf = getoption1min(api, cetoken, v1req.date)
+        peoptdf = getoption1min(api, petoken, v1req.date)
+        if ceoptdf.empty or peoptdf.empty:
+            return {
+                "status": "error",
+                "message": "No option data for this date",
+            }
+    else:
+        ceoptdf = base_idxdf
+        peoptdf = base_idxdf
+
+    # -------- BUY SIDE PROCESS --------
+    rule_for_buy = None
+    if buyentrycandle is not None:
+        buyentrytime = buyentrycandle.name
+        rule_for_buy = rule
+
+        buy_target = v1req.buy.t4 or 0.0
+
+        used_optdf = ceoptdf if not index_mode else base_idxdf
+        buyresult = processnormal(
+            base_idxdf,
+            used_optdf,
+            buyentrytime,
+            buyentrylevel,
+            buy_target,
+            v1req.buy.sl or 0.0,
+            "BUY",
+            lots,
+            is_half_gap=False,
+            half_gap_type=None,
+            rule=rule_for_buy,
+        )
+        buyresult["entrytime"] = str(buyentrytime)
+        buyresult["entryindex"] = float(buyentrycandle["close"])
+
+    # -------- SELL SIDE PROCESS --------
+    rule_for_sell = None
+    if sellentrycandle is not None:
+        sellentrytime = sellentrycandle.name
+        rule_for_sell = rule
+
+        sell_target = v1req.sell.t4 or 0.0
+
+        used_optdf = peoptdf if not index_mode else base_idxdf
+        sellresult = processnormal(
+            base_idxdf,
+            used_optdf,
+            sellentrytime,
+            sellentrylevel,
+            sell_target,
+            v1req.sell.sl or 0.0,
+            "SELL",
+            lots,
+            is_half_gap=False,
+            half_gap_type=None,
+            rule=rule_for_sell,
+        )
+        sellresult["entrytime"] = str(sellentrytime)
+        sellresult["entryindex"] = float(sellentrycandle["close"])
+
+    # -------- PRIMARY LEG (direction) --------
+    if boside_up == "BUYBO":
+        primary = buyresult
+        primary_side = "BUY"
+    elif boside_up == "SELLBO":
+        primary = sellresult
+        primary_side = "SELL"
+    else:
+        if buyresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
+            primary = buyresult
+            primary_side = "BUY"
+        elif sellresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
+            primary = sellresult
+            primary_side = "SELL"
+        else:
+            primary = {"status": "NOENTRY"}
+            primary_side = "BUY"
+
+    # -------- SUMMARY FIELDS --------
+    breakout_details: Dict[str, Any] = {
+        "orb_mode": orb_mode,
+        "trigger_side": trigger_side,
+        "trigger_time": trigger_time.strftime("%H:%M") if trigger_time else None,
+        "trigger_price": float(trigger_price) if trigger_price is not None else None,
+        "marked_high": float(marked_high),
+        "marked_low": float(marked_low),
+        "is_choti_day": False,
+        "use_midday_orb_only": False,
+    }
+
+    gann_details: Dict[str, Any] = {
+        "cmp_at_trigger": int(trigger_price) if trigger_price is not None else None,
+        "gann_rule": rule,
+        "high_vol_orb": high_vol_orb,
+        "excel_mode": "MORNING",
+        "buy": {
+            "entry": float(v1req.buy.level or 0.0),
+            "t2": float(getattr(v1req.buy, "t2", 0.0) or 0.0),
+            "t4": float(getattr(v1req.buy, "t4", 0.0) or 0.0),
+            "sl": float(v1req.buy.sl or 0.0),
+        },
+        "sell": {
+            "entry": float(v1req.sell.level or 0.0),
+            "t2": float(getattr(v1req.sell, "t2", 0.0) or 0.0),
+            "t4": float(getattr(v1req.sell, "t4", 0.0) or 0.0),
+            "sl": float(v1req.sell.sl or 0.0),
+        },
+    }
+
+    rule_tags: List[str] = []
+    rule_tags.append("ATR_NORMAL")
+    rule_tags.append("ORB_915")
+
+    POINT_VALUE_INDEX = 65
+    try:
+        qty_lots = v1req.lots
+    except AttributeError:
+        qty_lots = v1req.get("lots", 1)
+
+    primary_entry_time: Optional[str] = None
+    primary_entry_price: Optional[float] = None
+    primary_exit_time: Optional[str] = None
+    primary_exit_price: Optional[float] = None
+    primary_exit_reason: Optional[str] = None
+    primary_pnl: Optional[float] = None
+
+    if index_mode:
+        if primary_side == "BUY" and buyresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
+            primary_entry_time = buyresult.get("entrytime")
+            primary_entry_price = float(buyresult.get("entryindex", 0.0))
+            primary_exit_time = buyresult.get("exittime")
+            primary_exit_price = float(buyresult.get("exitindex", 0.0)) if buyresult.get(
+                "exitindex"
+            ) is not None else None
+            primary_exit_reason = buyresult.get("exitreason")
+            if primary_exit_price is not None:
+                points = primary_exit_price - primary_entry_price
+                primary_pnl = points * POINT_VALUE_INDEX * qty_lots
+        elif primary_side == "SELL" and sellresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
+            primary_entry_time = sellresult.get("entrytime")
+            primary_entry_price = float(sellresult.get("entryindex", 0.0))
+            primary_exit_time = sellresult.get("exittime")
+            primary_exit_price = float(sellresult.get("exitindex", 0.0)) if sellresult.get(
+                "exitindex"
+            ) is not None else None
+            primary_exit_reason = sellresult.get("exitreason")
+            if primary_exit_price is not None:
+                points = primary_entry_price - primary_exit_price
+                primary_pnl = points * POINT_VALUE_INDEX * qty_lots
+    else:
+        if primary_side == "BUY" and buyresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
+            primary_entry_time = buyresult.get("entrytime")
+            primary_entry_price = float(buyresult.get("entryindex", 0.0))
+            primary_exit_time = buyresult.get("exittime")
+            primary_exit_price = float(buyresult.get("exitindex", 0.0)) if buyresult.get(
+                "exitindex"
+            ) is not None else None
+            primary_exit_reason = buyresult.get("exitreason")
+            primary_pnl = float(buyresult.get("pnl", 0.0))
+        elif primary_side == "SELL" and sellresult.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
+            primary_entry_time = sellresult.get("entrytime")
+            primary_entry_price = float(sellresult.get("entryindex", 0.0))
+            primary_exit_time = sellresult.get("exittime")
+            primary_exit_price = float(sellresult.get("exitindex", 0.0)) if sellresult.get(
+                "exitindex"
+            ) is not None else None
+            primary_exit_reason = sellresult.get("exitreason")
+            primary_pnl = float(sellresult.get("pnl", 0.0))
+
+    trade_details: Dict[str, Any] = {
+        "primary_side": primary_side,
+        "entry_time": primary_entry_time,
+        "entry_price": primary_entry_price,
+        "exit_time": primary_exit_time,
+        "exit_price": primary_exit_price,
+        "exit_reason": primary_exit_reason,
+        "pnl_points": primary_pnl,
+    }
+
+    return {
+        "status": "ok",
+        "account": acc.name,
+        "v1req": v1req,
+        "boside": boside,
+        "boside_up": boside_up,
+        "index_mode": index_mode,
+        "buyresult": buyresult,
+        "sellresult": sellresult,
+        "primary": primary,
+        "primary_side": primary_side,
+        "cestrike": cestrike,
+        "pestrike": pestrike,
+        "cetoken": None if index_mode else cetoken,
+        "petoken": None if index_mode else petoken,
+        "is_choti_day": False,
+        "orb_mode": orb_mode,
         "breakout_details": breakout_details,
         "gann_details": gann_details,
         "rule_tags": rule_tags,

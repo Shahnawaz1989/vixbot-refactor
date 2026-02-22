@@ -1,7 +1,7 @@
 from typing import Any, Dict
 
-from vixmodels import VixRequest  # adjust import if needed
-from vixutils import cut_dec      # adjust path according to your project
+from models import VixRequest
+from gann_engine import cut_dec
 
 
 def map_gann_levels_to_v1req(

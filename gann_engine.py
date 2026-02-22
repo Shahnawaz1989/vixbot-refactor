@@ -80,6 +80,7 @@ def calc_gann_levels_with_excel(
         buy_t4 = row["buy_t4"]
         buy_t25 = row["buy_t25"]
         buy_t35 = row["buy_t35"]
+        buy_t15 = row.get("buy_t15", 0.0)  # yeh line add karo
         sell_entry = row["sell_entry_opp"]
         sell_t15 = row["sell_t15"]
         sell_t2 = row["sell_t2"]
@@ -111,9 +112,24 @@ def calc_gann_levels_with_excel(
     sell_sl = row["sell_sl"]
 
     levels: Dict[str, float] = {
-        "buy_entry":  float(buy_entry),
-        "buy_t2":     float(buy_t2),
-        "buy_t25":    float(buy_t25),
-        "buy_t3":     float(buy_t3),
-        "buy_t35":    float(buy_t35),
-        "buy_t4":     float(buy
+        "buy_entry": float(buy_entry),
+        "buy_t2":    float(buy_t2),
+        "buy_t25":   float(buy_t25),
+        "buy_t3":    float(buy_t3),
+        "buy_t35":   float(buy_t35),
+        "buy_t4":    float(buy_t4),
+        "buy_t15":   float(buy_t15) if "buy_t15" in row else 0.0,
+
+        "sell_entry": float(sell_entry),
+        "sell_t15":   float(sell_t15),
+        "sell_t2":    float(sell_t2),
+        "sell_t25":   float(sell_t25),
+        "sell_t3":    float(sell_t3),
+        "sell_t35":   float(sell_t35),
+        "sell_t4":    float(sell_t4),
+
+        "buy_sl":  float(buy_sl),
+        "sell_sl": float(sell_sl),
+    }
+
+    return levels

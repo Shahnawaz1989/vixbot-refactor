@@ -1,10 +1,12 @@
 # smartapi_helpers.py
 
+from typing import Tuple  # top pe
 from datetime import datetime, timedelta, time as dtime
 from typing import Optional, Dict, Any
 
 import pandas as pd
 from SmartApi import SmartConnect
+from price_rounding import round_index_price_for_side
 import pyotp
 import json
 
@@ -21,6 +23,7 @@ from config import (
 )
 
 # ========== SMARTAPI LOGIN ==========
+
 
 def smartlogin() -> Optional[SmartConnect]:
     totp = pyotp.TOTP(TOTPSECRET).now()
@@ -122,9 +125,11 @@ def get_orb_breakout_15min(idx1: pd.DataFrame) -> Dict[str, Any]:
     trade_date = idx15.index[0].date()
 
     # ORB candle timestamp = 10:00
-    orb_start = datetime.combine(trade_date, datetime.strptime("10:00", "%H:%M").time())
+    orb_start = datetime.combine(
+        trade_date, datetime.strptime("10:00", "%H:%M").time())
     # last VALID breakout candle timestamp = 12:15
-    orb_last  = datetime.combine(trade_date, datetime.strptime("12:15", "%H:%M").time())
+    orb_last = datetime.combine(
+        trade_date, datetime.strptime("12:15", "%H:%M").time())
 
     # 10:00–10:15 ORB candle
     if orb_start not in idx15.index:
@@ -132,7 +137,7 @@ def get_orb_breakout_15min(idx1: pd.DataFrame) -> Dict[str, Any]:
 
     orb_row = idx15.loc[orb_start]
     marked_high = float(orb_row["high"])
-    marked_low  = float(orb_row["low"])
+    marked_low = float(orb_row["low"])
 
     print("[ORB-DEBUG] ORB 10:00-10:15 High/Low:", marked_high, marked_low)
 
@@ -180,21 +185,19 @@ def get_orb_breakout_15min(idx1: pd.DataFrame) -> Dict[str, Any]:
         "marked_high": marked_high,
         "marked_low": marked_low,
     }
-    
+
 
 def get_midday_orb_breakout_15min(idx1: pd.DataFrame) -> Dict[str, Any]:
     """
     MID-DAY ORB breakout logic:
 
     - MID-DAY ORB candle: 12:30–12:45 (15-min)  -> timestamp 12:30
-    - Breakout candles: 12:45 ke baad saari 15-min candles,
-      koi upper cutoff nahi (EOD tak allowed).
+    - Breakout candles: 12:45 ke baad saari 15-min candles, EOD tak allowed.
     - Breakout:
         CLOSE > ORB high  -> BUY
         CLOSE < ORB low   -> SELL
-    - Gann CMP:
-        BUY  -> breakout candle ka HIGH
-        SELL -> breakout candle ka LOW
+    - Gann CMP / trigger_price:
+        BUY/SELL dono ke liye breakout candle ka CLOSE (NIFTY rounding rule ke saath)
     """
     if idx1.empty:
         return {"status": "error", "message": "Empty index DF"}
@@ -232,7 +235,12 @@ def get_midday_orb_breakout_15min(idx1: pd.DataFrame) -> Dict[str, Any]:
     marked_high = float(orb_row["high"])
     marked_low = float(orb_row["low"])
 
-    print("[MID-ORB-DEBUG] MID ORB 12:30-12:45 High/Low:", marked_high, marked_low)
+    print("[MID-ORB-DEBUG] MID ORB 12:30-12:45 High/Low:",
+          marked_high, marked_low)
+
+    # NIFTY index ke rounded MIDDAY trigger levels (ORB high/low se)
+    rounded_buy_mid = round_index_price_for_side(marked_high, "BUY")
+    rounded_sell_mid = round_index_price_for_side(marked_low, "SELL")
 
     # Breakout: saari 15-min candles AFTER 12:30 candle (no upper cutoff)
     trigger_df = idx15[idx15.index > orb_mid_start]
@@ -250,25 +258,31 @@ def get_midday_orb_breakout_15min(idx1: pd.DataFrame) -> Dict[str, Any]:
         h = float(row["high"])
         l = float(row["low"])
 
-        if c > marked_high:
-            print("[MID-ORB-DEBUG] BUY breakout at", ts, "close", c, "high", h)
+        # BUY breakout: close must reach rounded_buy_mid
+        if c >= rounded_buy_mid:
+            trigger_price = round_index_price_for_side(c, "BUY")
+            print("[MID-ORB-DEBUG] BUY breakout at",
+                  ts, "close", c, "tp", trigger_price)
             return {
                 "status": "ok",
                 "trigger_side": "BUY",
                 "trigger_time": ts,
-                "trigger_price": h,  # breakout candle HIGH
+                "trigger_price": trigger_price,  # breakout CLOSE (rounded)
                 "marked_high": marked_high,
                 "marked_low": marked_low,
                 "mode": "MIDDAY",
             }
 
-        if c < marked_low:
-            print("[MID-ORB-DEBUG] SELL breakout at", ts, "close", c, "low", l)
+        # SELL breakout: close must reach rounded_sell_mid
+        if c <= rounded_sell_mid:
+            trigger_price = round_index_price_for_side(c, "SELL")
+            print("[MID-ORB-DEBUG] SELL breakout at",
+                  ts, "close", c, "tp", trigger_price)
             return {
                 "status": "ok",
                 "trigger_side": "SELL",
                 "trigger_time": ts,
-                "trigger_price": l,  # breakout candle LOW
+                "trigger_price": trigger_price,  # breakout CLOSE (rounded)
                 "marked_high": marked_high,
                 "marked_low": marked_low,
                 "mode": "MIDDAY",
@@ -405,7 +419,8 @@ def detect_gap_day(idxdf: pd.DataFrame, prev_high: float, prev_low: float) -> Di
     else:
         gtype = "NORMAL"
 
-    print(f"[GAP] first_low={first_low}, first_high={first_high}, prev_high={prev_high}, prev_low={prev_low}, type={gtype}")
+    print(
+        f"[GAP] first_low={first_low}, first_high={first_high}, prev_high={prev_high}, prev_low={prev_low}, type={gtype}")
 
     return {"gap_type": gtype, "gap_up": gap_up, "gap_down": gap_down}
 
@@ -429,7 +444,7 @@ def round_to_atm_strike(index_price: float) -> int:
         return base + 50
 
 
-def calc_atm_strikes(openprice: float) -> (int, int):
+def calc_atm_strikes(openprice: float) -> Tuple[int, int]:
     """
     CE/PE dono same ATM strike (round_to_atm_strike se).
     """
@@ -447,7 +462,8 @@ def getoptiontoken(strike: int, expiry: str, opttype: str) -> Optional[str]:
         records = data if isinstance(data, list) else data.get("data", [])
 
         strike_in_file_units = float(strike) * 100.0
-        expirycode = datetime.strptime(expiry, "%Y-%m-%d").strftime("%d%b%Y").upper()
+        expirycode = datetime.strptime(
+            expiry, "%Y-%m-%d").strftime("%d%b%Y").upper()
 
         print(
             "DEBUG getoptiontoken: strike_idx", strike,
@@ -467,10 +483,12 @@ def getoptiontoken(strike: int, expiry: str, opttype: str) -> Optional[str]:
                 row_expiry = (row.get("expiry") or "").upper()
 
                 if row_strike == strike_in_file_units and row_expiry == expirycode:
-                    print("DEBUG token hit:", row.get("symbol"), row_strike, row_expiry)
+                    print("DEBUG token hit:", row.get(
+                        "symbol"), row_strike, row_expiry)
                     return str(row.get("token"))
 
-        print("DEBUG token not found for", strike_in_file_units, expirycode, opttype)
+        print("DEBUG token not found for",
+              strike_in_file_units, expirycode, opttype)
         return None
     except Exception as e:
         print("getoptiontoken error", e)

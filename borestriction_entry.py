@@ -3,8 +3,8 @@ from typing import Any, Dict, Tuple
 
 import pandas as pd
 
-from vixconfig import DEFAULTBOSTART          # adjust path if needed
-from vixengine import applyborestriction, findentryidx  # adjust path
+from config import DEFAULTBOSTART
+from strategy import applyborestriction, findentryidx
 
 
 def apply_default_bo_start_filter(idxdf: pd.DataFrame) -> pd.DataFrame:
