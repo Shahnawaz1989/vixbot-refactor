@@ -1136,7 +1136,7 @@ def run_v2_orb_gann_backtest_logic(
     else:
         print("[ATR REGIME] skip: insufficient daily data for ATR")
 
-    # -------- ATR REGIME USING DAILY HISTORY (NEW, OPTIONAL LOGGING) --------
+    # -------- ATR REGIME USING DAILY HISTORY (Angel) - LOGGING ONLY --------
     daily_hist = get_nifty_daily_history_for_atr(api, v1req.date)
     if daily_hist is None:
         print("[ATR-REGIME-DAILY] daily_hist is None")
@@ -1149,7 +1149,6 @@ def run_v2_orb_gann_backtest_logic(
             prev_atr = float(prev_row_hist["atr"])
             prev_range = prev_high - prev_low
             prev_ratio_hist = float(prev_row_hist["ratio"])
-
             print(
                 f"[ATR-REGIME-DAILY] prev_date={prev_row_hist['date']} "
                 f"range={prev_range:.2f} atr14={prev_atr:.2f} ratio={prev_ratio_hist:.2f}"
@@ -1439,12 +1438,22 @@ def run_v2_orb_gann_backtest_logic(
         v1req.buy.sl = cut_dec(levels["sell_entry"])
         v1req.sell.sl = cut_dec(levels["buy_entry"])
 
-    # -------- BOT-3 GANN LEVELS (H8/M8/N8/J8) --------
+    # -------- BOT-3 GANN LEVELS (raw) --------
     bot3_gann_levels = {
-        "H8": float(levels.get("H8", 0.0)),
-        "M8": float(levels.get("M8", 0.0)),
-        "N8": float(levels.get("N8", 0.0)),
-        "J8": float(levels.get("J8", 0.0)),
+        "buy_entry":  float(levels.get("buy_entry",  0.0)),
+        "buy_t15":    float(levels.get("buy_t15",    0.0)),
+        "buy_t2":     float(levels.get("buy_t2",     0.0)),
+        "buy_t25":    float(levels.get("buy_t25",    0.0)),
+        "buy_t3":     float(levels.get("buy_t3",     0.0)),
+        "buy_t35":    float(levels.get("buy_t35",    0.0)),
+        "buy_t4":     float(levels.get("buy_t4",     0.0)),
+        "sell_entry": float(levels.get("sell_entry", 0.0)),
+        "sell_t15":   float(levels.get("sell_t15",   0.0)),
+        "sell_t2":    float(levels.get("sell_t2",    0.0)),
+        "sell_t25":   float(levels.get("sell_t25",   0.0)),
+        "sell_t3":    float(levels.get("sell_t3",    0.0)),
+        "sell_t35":   float(levels.get("sell_t35",   0.0)),
+        "sell_t4":    float(levels.get("sell_t4",    0.0)),
     }
 
     # -------- ATR REGIME USING DAILY HISTORY (NEW) --------

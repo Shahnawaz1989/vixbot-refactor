@@ -1,67 +1,91 @@
-# bot3_high_vol_rule.py
-
 from typing import Dict, Any
 import pandas as pd
 from datetime import datetime, time
+import math
+
+
+def round_index_price_for_side(price: float, side: str) -> float:
+    side = (side or "").upper()
+    if side == "BUY":
+        # hamesha upar round
+        return float(math.ceil(price))
+    elif side == "SELL":
+        # hamesha neeche round
+        return float(math.floor(price))
+    else:
+        # default: normal int
+        return float(int(price))
 
 
 def run_bot3_method_a(
-    idx15: pd.DataFrame,
+    idx1m: pd.DataFrame,  # ✅ FIX 4: idx15 → idx1m
     bo_ctx: Dict[str, Any],
     gann_map: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Method A – GHB style, 10:30 ke baad tight entry.
-    - Sirf 10:30 ke baad entry allow.
-    - Primary leg = H8 (BUY) / N8 (SELL).
-    - Hedge leg = M8 (BUY hedge for SELL) / J8 (SELL hedge for BUY).
-    """
     tradedate = bo_ctx["trade_date"]
-    boside = bo_ctx["boside"]          # "BUY" / "SELL"
-    bo_time = bo_ctx["bo_time"]        # datetime
-    atr15_915 = bo_ctx["atr15_915"]    # float
+    boside = bo_ctx["boside"]
+    bo_time = bo_ctx["bo_time"]
+    atr15_915 = bo_ctx["atr15_915"]
 
-    # 10:30 ke pehle Method A entry mat lo
-    cutoff = time(10, 30)
-    if bo_time.time() < cutoff:
-        print("[BOT3-METHOD-A] BO before 10:30, skip Method A, use Method B.")
-        return {"status": "SKIP_METHOD_A", "reason": "BO_BEFORE_1030"}
+    # ✅ FIX 2: 10:30 skip block completely removed
 
-    # 10:30 ke baad, BO candle ke close ke aas-paas ek simple band bana sakte ho
-    # filhaal tight band logic simple rakhenge: +/- 0.5 * ATR15_915
-    # (baad me tune kar sakte ho)
     band = 0.5 * atr15_915
 
     if boside == "BUY":
         primary_key = "H8"
-        hedge_key = "J8"   # OPP side hedge
+        hedge_key = "J8"
     else:
         primary_key = "N8"
         hedge_key = "M8"
 
-    primary_entry = gann_map.get(primary_key)
-    hedge_entry = gann_map.get(hedge_key)
+    primary_entry = gann_map.get("primary_entry")
+    hedge_entry = gann_map.get("opp_entry")
+
+    # ✅ FIX 5: Gann levels rounding
+    primary_entry = round_index_price_for_side(
+        float(primary_entry), "BUY" if boside == "BUY" else "SELL")
+    hedge_entry = round_index_price_for_side(
+        float(hedge_entry), "SELL" if boside == "BUY" else "BUY")
 
     print(
         f"[BOT3-METHOD-A] {tradedate} boside={boside} "
-        f"primary={primary_key}={primary_entry} hedge={hedge_key}={hedge_entry} "
-        f"band={band:.2f}"
+        f"bo_time={bo_time} primary={primary_entry} hedge={hedge_entry} band={band:.2f}"
     )
 
     if primary_entry is None or hedge_entry is None:
         return {"status": "SKIP_METHOD_A", "reason": "MISSING_GANN_LEVELS"}
 
-    # Abhi ke liye, sirf mapping return kar rahe hain, actual trade execution
-    # outer engine karega (jaise existing bots me hota hai)
+    # ✅ FIX 3: 1-min entry search loop added (10:31+ entry)
+    entry_cutoff = datetime.combine(tradedate, time(10, 31))
+    late_cutoff = datetime.combine(tradedate, time(13, 30))
+    eod_cutoff = datetime.combine(tradedate, time(15,  0))
+
+    search_df = idx1m[(idx1m.index >= entry_cutoff)
+                      & (idx1m.index <= eod_cutoff)]
+
+    entry_time = None
+    entry_rule = None
+    for ts, row in search_df.iterrows():
+        if row["low"] <= primary_entry <= row["high"]:
+            entry_time = ts
+            is_late = ts >= late_cutoff
+            entry_rule = "ORB_LATE" if is_late else "ATR_NORMAL"
+            break
+
+    if entry_time is None:
+        return {"status": "SKIP_METHOD_A", "reason": "NO_ENTRY_CANDLE"}
+
+    print(f"[BOT3-METHOD-A] Entry found at {entry_time} rule={entry_rule}")
+
     return {
         "status": "OK_METHOD_A",
         "method": "A",
         "boside": boside,
-        "primary_key": primary_key,
         "primary_entry": float(primary_entry),
-        "hedge_key": hedge_key,
         "hedge_entry": float(hedge_entry),
         "band": float(band),
+        "entry_time": entry_time,
+        "entry_rule": entry_rule,
     }
 
 
@@ -76,8 +100,8 @@ def run_bot3_method_b(
     - Hedge leg J8/M8 simple.
     """
     tradedate = bo_ctx["trade_date"]
-    boside = bo_ctx["boside"]          # "BUY" / "SELL"
-    atr15_915 = bo_ctx["atr15_915"]    # float
+    boside = bo_ctx["boside"]
+    atr15_915 = bo_ctx["atr15_915"]
 
     if boside == "BUY":
         primary_key = "H8"
@@ -88,6 +112,12 @@ def run_bot3_method_b(
 
     primary_entry = gann_map.get(primary_key)
     hedge_entry = gann_map.get(hedge_key)
+
+    # ✅ FIX 5: Rounding for Method B also
+    primary_entry = round_index_price_for_side(
+        float(primary_entry), "BUY" if boside == "BUY" else "SELL")
+    hedge_entry = round_index_price_for_side(
+        float(hedge_entry), "SELL" if boside == "BUY" else "BUY")
 
     print(
         f"[BOT3-METHOD-B] {tradedate} boside={boside} "
@@ -116,9 +146,6 @@ def detect_bot3_method(
 ) -> Dict[str, Any]:
     """
     Decide Method A vs Method B for Bot-3 based on 9:15 candle range vs ATR.
-
-    - idx1m: full 1-min index DF for trade_date (DatetimeIndex)
-    - atr15_at_915: 15-min ATR(14) value at 9:15 candle (externally computed)
 
     Method A: range_915 / atr15_at_915 > 2.0
     Method B: otherwise
@@ -153,7 +180,9 @@ def detect_bot3_method(
     method = "A" if ratio > 2.0 else "B"
 
     print(
-        f"[BOT3-METHOD] range_915={range_915:.2f} atr15_915={atr15_at_915:.2f} ratio={ratio:.2f} method={method}")
+        f"[BOT3-METHOD] range_915={range_915:.2f} atr15_915={atr15_at_915:.2f} "
+        f"ratio={ratio:.2f} method={method}"
+    )
 
     return {
         "method": method,
@@ -168,8 +197,8 @@ def build_bot3_breakout_context(
     """
     9:15 ORB breakout context for Bot-3.
 
-    - Mark 9:15-9:30 high/low.
-    - Find 15-min close-based BO (9:30 ke baad) till 12:15.
+    - Mark 9:15-9:30 high/low.  (ORB style)
+    - 9:30–12:15 window me 15-min close-based breakout detect karo. (ORB pattern)
     """
     if idx1m.empty:
         return {
@@ -181,18 +210,30 @@ def build_bot3_breakout_context(
             "marked_low": None,
         }
 
+    if not isinstance(idx1m.index, pd.DatetimeIndex):
+        if "time" in idx1m.columns:
+            idx1m = idx1m.copy()
+            idx1m["time"] = pd.to_datetime(idx1m["time"])
+            idx1m = idx1m.set_index("time")
+        else:
+            return {
+                "status": "ERROR",
+                "bo_side": None,
+                "bo_time": None,
+                "bo_close": None,
+                "marked_high": None,
+                "marked_low": None,
+            }
+
     tradedate = idx1m.index[0].date()
 
-    start_915 = datetime.combine(
-        tradedate, datetime.strptime("09:15", "%H:%M").time())
-    end_930 = datetime.combine(
-        tradedate, datetime.strptime("09:30", "%H:%M").time())
-    end_bo = datetime.combine(
-        tradedate, datetime.strptime("12:15", "%H:%M").time())
+    # 9:15–9:30 marking window (ORB style, bas time alag)
+    mark_start = datetime.combine(tradedate, time(9, 15))
+    mark_end = datetime.combine(tradedate, time(9, 30))
+    bo_window_end = datetime.combine(tradedate, time(12, 15))
 
-    # 9:15-9:30 ORB window
-    orb915 = idx1m[(idx1m.index >= start_915) & (idx1m.index < end_930)]
-    if orb915.empty:
+    marking = idx1m[(idx1m.index >= mark_start) & (idx1m.index < mark_end)]
+    if marking.empty:
         return {
             "status": "ERROR",
             "bo_side": None,
@@ -202,12 +243,19 @@ def build_bot3_breakout_context(
             "marked_low": None,
         }
 
-    marked_high = float(orb915["high"].max())
-    marked_low = float(orb915["low"].min())
+    # ORB pattern: raw mark, phir rounded triggers
+    marked_high = float(marking["high"].max())
+    marked_low = float(marking["low"].min())
 
-    # 9:30 se 12:15 tak 15-min candles
-    trigger_window = idx1m[(idx1m.index >= end_930) & (idx1m.index <= end_bo)]
-    if trigger_window.empty:
+    rounded_buy_trigger = round_index_price_for_side(marked_high, "BUY")
+    rounded_sell_trigger = round_index_price_for_side(marked_low, "SELL")
+
+    # 9:30–12:15 ORB-style trigger window
+    trigger_df = idx1m[
+        (idx1m.index >= mark_end) &
+        (idx1m.index <= bo_window_end)
+    ]
+    if trigger_df.empty:
         return {
             "status": "NO_BO",
             "bo_side": None,
@@ -217,8 +265,9 @@ def build_bot3_breakout_context(
             "marked_low": marked_low,
         }
 
+    # ORB jaisa hi 15-min resample (simple, bina shift hack)
     agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
-    trigger15 = trigger_window.resample("15min").agg(agg).dropna()
+    trigger15 = trigger_df.resample("15min").agg(agg).dropna()
 
     bo_side = None
     bo_time = None
@@ -226,16 +275,27 @@ def build_bot3_breakout_context(
 
     for ts, row in trigger15.iterrows():
         close_price = float(row["close"])
+        high_price = float(row["high"])
+        low_price = float(row["low"])
 
-        if close_price > marked_high:
+        print(
+            f"[BOT3-ORB-STYLE-15M] {ts} close={close_price} "
+            f"high={high_price} low={low_price} "
+            f"rbuy={rounded_buy_trigger} rsell={rounded_sell_trigger}"
+        )
+
+        # BUY breakout: close must reach rounded_buy_trigger (ORB pattern)
+        if close_price >= rounded_buy_trigger:
             bo_side = "BUY"
             bo_time = ts
-            bo_close = close_price
+            bo_close = round_index_price_for_side(close_price, "BUY")
             break
-        if close_price < marked_low:
+
+        # SELL breakout: close must reach rounded_sell_trigger
+        if close_price <= rounded_sell_trigger:
             bo_side = "SELL"
             bo_time = ts
-            bo_close = close_price
+            bo_close = round_index_price_for_side(close_price, "SELL")
             break
 
     if bo_side is None:
@@ -261,24 +321,102 @@ def build_bot3_breakout_context(
 
 
 def map_bot3_gann_levels(
+    bo_side: str,
     gann_levels: Dict[str, float],
+    atr14: float,
+    method: str,  # "A" ya "B"
 ) -> Dict[str, Any]:
     """
-    Bot-3 ke liye H8/M8/N8/J8 raw levels dict.
-    Yahan side-decisions nahi, sirf numbers.
-    """
-    h8 = float(gann_levels.get("H8", 0.0))
-    m8 = float(gann_levels.get("M8", 0.0))
-    n8 = float(gann_levels.get("N8", 0.0))
-    j8 = float(gann_levels.get("J8", 0.0))
+    Bot-3 ka complete entry/target/sl system.
 
-    print(f"[BOT3-GANN] H8={h8} M8={m8} N8={n8} J8={j8}")
+    Method A OPP entry: sell_t2 / buy_t2 (tighter)
+    Method B OPP entry: sell_entry / buy_entry (normal)
+
+    Target dono me same: base_entry +/- ATR * 1.5 closest level
+    SL dono me same: BUY SL = sell_entry, SELL SL = buy_entry
+    """
+
+    def pick_buy_target(base_entry: float) -> float:
+        if atr14 <= 0:
+            return float(gann_levels.get("buy_t2", 0.0))
+        raw_target = base_entry + atr14 * 1.5
+        candidates = [
+            gann_levels.get("buy_t2",  0.0),
+            gann_levels.get("buy_t25", 0.0),
+            gann_levels.get("buy_t3",  0.0),
+            gann_levels.get("buy_t35", 0.0),
+            gann_levels.get("buy_t4",  0.0),
+        ]
+        below = [x for x in candidates if x <= raw_target]
+        result = max(below) if below else min(candidates)
+        print(
+            f"[BOT3-TARGET] BUY base={base_entry:.2f} raw={raw_target:.2f} target={result:.2f}")
+        return float(result)
+
+    def pick_sell_target(base_entry: float) -> float:
+        if atr14 <= 0:
+            return float(gann_levels.get("sell_t2", 0.0))
+        raw_target = base_entry - atr14 * 1.5
+        candidates = [
+            gann_levels.get("sell_t2",  0.0),
+            gann_levels.get("sell_t25", 0.0),
+            gann_levels.get("sell_t3",  0.0),
+            gann_levels.get("sell_t35", 0.0),
+            gann_levels.get("sell_t4",  0.0),
+        ]
+        above = [x for x in candidates if x >= raw_target]
+        result = min(above) if above else max(candidates)
+        print(
+            f"[BOT3-TARGET] SELL base={base_entry:.2f} raw={raw_target:.2f} target={result:.2f}")
+        return float(result)
+
+    # OPP entry method ke hisaab se
+    if method == "A":
+        opp_buy_entry_key = "buy_t2"
+        opp_sell_entry_key = "sell_t2"
+    else:  # Method B
+        opp_buy_entry_key = "buy_entry"
+        opp_sell_entry_key = "sell_entry"
+
+    if bo_side == "BUY":
+        primary_entry = float(gann_levels.get("buy_t15",           0.0))
+        primary_sl = float(gann_levels.get("sell_entry",         0.0))
+        primary_target = pick_buy_target(
+            float(gann_levels.get("buy_entry", 0.0)))
+
+        opp_entry = float(gann_levels.get(opp_sell_entry_key,   0.0))
+        opp_sl = float(gann_levels.get("buy_entry",          0.0))
+        opp_target = pick_sell_target(
+            float(gann_levels.get("sell_entry", 0.0)))
+
+    elif bo_side == "SELL":
+        primary_entry = float(gann_levels.get("sell_t15",           0.0))
+        primary_sl = float(gann_levels.get("buy_entry",          0.0))
+        primary_target = pick_sell_target(
+            float(gann_levels.get("sell_entry", 0.0)))
+
+        opp_entry = float(gann_levels.get(opp_buy_entry_key,    0.0))
+        opp_sl = float(gann_levels.get("sell_entry",         0.0))
+        opp_target = pick_buy_target(float(gann_levels.get("buy_entry", 0.0)))
+
+    else:
+        return {}
+
+    print(
+        f"[BOT3-GANN-MAP] method={method} bo_side={bo_side}\n"
+        f"  PRIMARY: entry={primary_entry} sl={primary_sl} target={primary_target}\n"
+        f"  OPP:     entry={opp_entry} sl={opp_sl} target={opp_target}"
+    )
 
     return {
-        "H8": h8,
-        "M8": m8,
-        "N8": n8,
-        "J8": j8,
+        "method":          method,
+        "bo_side":         bo_side,
+        "primary_entry":   primary_entry,
+        "primary_sl":      primary_sl,
+        "primary_target":  primary_target,
+        "opp_entry":       opp_entry,
+        "opp_sl":          opp_sl,
+        "opp_target":      opp_target,
     }
 
 
@@ -288,35 +426,107 @@ def run_bot3_entry_engine(
     atr15_at_915: float,
     gann_levels: Dict[str, float],
 ) -> Dict[str, Any]:
-    """
-    Top-level Bot-3 engine (morning leg).
-    """
+
     method_info = detect_bot3_method(idx1m, atr15_at_915)
     bo_ctx = build_bot3_breakout_context(idx1m)
 
+    # ❗ 9:15 ORB window me breakout na mile -> yahin se NO_BO tag de do
     if bo_ctx["status"] != "OK":
+        # yahin se caller decide karega ki MIDDAY / 9:15-ORB bot call karna hai
         return {
-            "status": f"SKIP_{bo_ctx['status']}",
+            "status": f"SKIP_{bo_ctx['status']}",  # e.g. SKIP_NO_BO
             "method": method_info["method"],
             "bo_ctx": bo_ctx,
         }
-    # yahan bo_ctx enrich karo
+
     bo_ctx["trade_date"] = idx1m.index[0].date()
     bo_ctx["boside"] = bo_ctx["bo_side"]
     bo_ctx["bo_time"] = bo_ctx["bo_time"]
     bo_ctx["atr15_915"] = atr15_at_915
 
-    gann_map = map_bot3_gann_levels(gann_levels)
+    method = method_info["method"]
 
-    if method_info["method"] == "A":
-        res = run_bot3_method_a(idx15, bo_ctx, gann_map)
+    gann_map = map_bot3_gann_levels(
+        bo_side=bo_ctx["bo_side"],
+        gann_levels=gann_levels,
+        atr14=atr15_at_915,
+        method=method,
+    )
+
+    if method == "A":
+        res_a = run_bot3_method_a(idx1m, bo_ctx, gann_map)
+        if res_a.get("status") != "OK_METHOD_A":
+            return {
+                "status": "NO_TRADE_METHOD_A",
+                "method": "A",
+                "bo_ctx": bo_ctx,
+                "gann_map": gann_map,
+                "inner": res_a,
+            }
+        return {
+            "status": "BOT3_OK_METHOD_A",
+            "method": "A",
+            "bo_ctx": bo_ctx,
+            "gann_map": gann_map,
+            "inner": res_a,
+        }
+
     else:
-        res = run_bot3_method_b(idx15, bo_ctx, gann_map)
+        res_b = run_bot3_method_b(idx15, bo_ctx, gann_map)
+        return {
+            "status": res_b.get("status", "BOT3_OK_METHOD_B"),
+            "method": "B",
+            "bo_ctx": bo_ctx,
+            "gann_map": gann_map,
+            "inner": res_b,
+        }
 
+
+def run_bot3_high_vol_strategy(
+    api,
+    acc,
+    v1req,
+    idxdf_daily,
+    idxdf_1min,
+    trade_date,
+    gann_levels: Dict[str, float],
+) -> Dict[str, Any]:
+    """
+    HIGH_VOL (prev day HL/ATR > 1.4999) ke liye special Bot-3.
+    Abhi: sirf Bot-3 9:15 ORB try karega; NO_BO pe koi fallback nahi.
+    """
+
+    # 1-min -> 15-min
+    idx15 = (
+        idxdf_1min
+        .resample("15min")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+        .dropna()
+    )
+
+    # 15-min ATR(14)
+    high_low = idx15["high"] - idx15["low"]
+    high_close = (idx15["high"] - idx15["close"].shift()).abs()
+    low_close = (idx15["low"] - idx15["close"].shift()).abs()
+    tr15 = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr15 = tr15.rolling(window=14).mean()
+
+    atr_series = atr15.dropna()
+    atr15_at_915 = float(atr_series.iloc[0]) if not atr_series.empty else 0.0
+    print(f"[BOT3-ATR-15M] atr15_at_915={atr15_at_915:.2f}")
+
+    bot3_result = run_bot3_entry_engine(
+        idx1m=idxdf_1min,
+        idx15=idx15,
+        atr15_at_915=atr15_at_915,
+        gann_levels=gann_levels,
+    )
+
+    status = bot3_result.get("status", "BOT3_PENDING")
+
+    # Abhi koi fallback nahi
     return {
-        "status": res.get("status", "BOT3_OK"),
-        "method": method_info["method"],
-        "bo_ctx": bo_ctx,
-        "gann_map": gann_map,
-        "inner": res,
+        "status": status,
+        "bot3": bot3_result,
+        "fallback_midday_orb": None,
     }
