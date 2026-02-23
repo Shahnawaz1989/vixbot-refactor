@@ -564,54 +564,32 @@ def place_market_order(
             "stoploss": 0,
             "trailingStopLoss": 0,
         }
+
         print("[ORDER-REQ TIME]", datetime.now(), payload)
-        # SmartAPI ka official signature: placeOrder(payload_dict)
-        res = api.placeOrder(payload)
+        try:
+            res = api.placeOrder(payload)
+        except Exception as inner:
+            print("[ORDER ERROR RAW-EXC]", repr(inner))
+            return {"status": "error", "message": str(inner)}
+
         print("[RAW ORDER RES]", res)
-        return {"status": "ok", "response": res}
+
+        ok = True
+        msg = ""
+        if isinstance(res, dict):
+            ok = bool(res.get("status", True))
+            msg = (
+                res.get("message")
+                or res.get("error")
+                or res.get("errorMsg")
+                or str(res)
+            )
+        else:
+            msg = str(res)
+
+        return {"status": ok, "message": msg, "raw": res}
     except Exception as e:
         import traceback
-        print("[ORDER ERROR RAW]", repr(e))
-        traceback.print_exc()
-        return {"status": "error", "message": str(e)}
-
-
-def exit_position(
-    api: SmartConnect,
-    tradingsymbol: str,
-    symboltoken: str,
-    side: str,
-    quantity: int,
-    exchange: str = "NFO",
-    product: str = "NRML",
-    ordertype: str = "MARKET",
-    variety: str = "NORMAL",
-) -> dict:
-    from datetime import datetime
-    try:
-        opposite = "SELL" if side.upper() == "BUY" else "BUY"
-        payload = {
-            "variety": variety,
-            "tradingsymbol": tradingsymbol,
-            "symboltoken": symboltoken,
-            "transactiontype": opposite,
-            "exchange": exchange,
-            "ordertype": ordertype,
-            "producttype": product,
-            "duration": "DAY",
-            "price": 0,
-            "triggerprice": 0,
-            "quantity": int(quantity),
-            "squareoff": 0,
-            "stoploss": 0,
-            "trailingStopLoss": 0,
-        }
-        print("[EXIT-REQ TIME]", datetime.now(), payload)
-        res = api.placeOrder(payload)
-        print("[RAW EXIT RES]", res)
-        return {"status": "ok", "response": res}
-    except Exception as e:
-        import traceback
-        print("[EXIT ERROR RAW]", repr(e))
+        print("[ORDER ERROR RAW-OUTER]", repr(e))
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
