@@ -889,12 +889,12 @@ def place_market_order(
     """
     payload = {
         "variety": "NORMAL",
-        "tradingsymbol": "NIFTY",      # tumhare token se expiry+strike map hoti hai
+        "tradingsymbol": "NIFTY",
         "symboltoken": token,
-        "transactiontype": side,       # "BUY" / "SELL"
+        "transactiontype": side,   # "BUY" / "SELL"
         "exchange": "NFO",
         "ordertype": "MARKET",
-        "producttype": "NRML",         # ya MIS agar tum intraday chahte ho
+        "producttype": "NRML",
         "duration": "DAY",
         "quantity": qty,
         "price": "0",
@@ -906,18 +906,47 @@ def place_market_order(
     print(f"[ORDER REQ] {side} {qty} @ {token} payload={payload}")
     try:
         res = api.placeOrder(payload)
-        print(f"[ORDER RES] {side} {qty} @ {token}: {res}")
+        print(f"[ORDER RES RAW] {side} {qty} @ {token}: {res}")
 
-        # SmartAPI kabhi string order id, kabhi dict deta hai
+        # Normalise SmartAPI response
+        status = False
+        msg = ""
+        order_id = None
+
         if isinstance(res, str):
-            return {"status": True, "orderid": res}
-        # dict me status flag nahi ho to bhi normalize kar lo
-        if isinstance(res, dict) and "status" not in res:
-            res = {"status": True, **res}
-        return res
+            # often plain order id string
+            status = True
+            order_id = res
+            msg = res
+        elif isinstance(res, dict):
+            status = bool(res.get("status", True))
+            # SmartAPI kabhi-kabhi "data" me order id deta hai
+            data = res.get("data") or {}
+            if isinstance(data, dict):
+                order_id = data.get("orderid") or data.get("order_id")
+            # best-effort message
+            msg = (
+                res.get("message")
+                or res.get("error")
+                or res.get("errorMsg")
+                or str(res)
+            )
+        else:
+            # unknown type
+            msg = str(res)
+
+        if not status:
+            print(f"[ORDER ERROR] {side} {qty} @ {token}: {msg}")
+
+        return {
+            "status": status,
+            "message": msg,
+            "orderid": order_id,
+            "raw": res,
+        }
     except Exception as e:
-        print(f"[ORDER ERROR] {side} {qty} @ {token}: {e}")
-        return {"status": False, "message": str(e)}
+        print(f"[ORDER EXCEPTION] {side} {qty} @ {token}: {e}")
+        return {"status": False, "message": str(e), "raw": None}
 
 
 def exit_position(
@@ -926,16 +955,13 @@ def exit_position(
     side: str,
     qty: int,
 ) -> Dict[str, Any]:
-    """
-    Existing position exit kare:
-    - Agar entry BUY thi to yahan side='BUY' doge, ye SELL karega.
-    - Agar entry SELL thi to yahan side='SELL', ye BUY karega.
-    """
+    exitside = "SELL" if side == "BUY" else "BUY"
+
     payload = {
         "variety": "NORMAL",
         "tradingsymbol": "NIFTY",
         "symboltoken": token,
-        "transactiontype": "SELL" if side == "BUY" else "BUY",
+        "transactiontype": exitside,
         "exchange": "NFO",
         "ordertype": "MARKET",
         "producttype": "NRML",
@@ -950,15 +976,42 @@ def exit_position(
     print(f"[EXIT REQ] {side} {qty} @ {token} payload={payload}")
     try:
         res = api.placeOrder(payload)
-        print(f"[EXIT RES] {side} {qty} @ {token}: {res}")
+        print(f"[EXIT RES RAW] {side} {qty} @ {token}: {res}")
+
+        status = False
+        msg = ""
+        order_id = None
+
         if isinstance(res, str):
-            return {"status": True, "orderid": res}
-        if isinstance(res, dict) and "status" not in res:
-            res = {"status": True, **res}
-        return res
+            status = True
+            order_id = res
+            msg = res
+        elif isinstance(res, dict):
+            status = bool(res.get("status", True))
+            data = res.get("data") or {}
+            if isinstance(data, dict):
+                order_id = data.get("orderid") or data.get("order_id")
+            msg = (
+                res.get("message")
+                or res.get("error")
+                or res.get("errorMsg")
+                or str(res)
+            )
+        else:
+            msg = str(res)
+
+        if not status:
+            print(f"[EXIT ERROR] {side} {qty} @ {token}: {msg}")
+
+        return {
+            "status": status,
+            "message": msg,
+            "orderid": order_id,
+            "raw": res,
+        }
     except Exception as e:
-        print(f"[EXIT ERROR] {side} {qty} @ {token}: {e}")
-        return {"status": False, "message": str(e)}
+        print(f"[EXIT EXCEPTION] {side} {qty} @ {token}: {e}")
+        return {"status": False, "message": str(e), "raw": None}
 
 
 def get_live_option_ltp(api: SmartConnect, token: str) -> float:
