@@ -1,4 +1,3 @@
-# from first15min_sync_breakout import apply_first15min_sync_filter
 from prev_day_hl_breakout import check_breakout as check_breakout_local
 from borestriction_entry import (
     apply_default_bo_start_filter,
@@ -24,7 +23,12 @@ from gann_engine import (
     GANN_TABLE,
     GANN_MIDDAY_TABLE,
 )
-from half_gap_rule import detect_half_gap, get_angel_atr_14, atr_tradingview_style
+from half_gap_rule import (
+    detect_half_gap,
+    get_angel_atr_14,
+    atr_tradingview_style,
+    detect_hook_930_exact,
+)
 from gap_day_rule import detect_gap_day
 from config import (
     APIKEY,
@@ -37,6 +41,8 @@ from config import (
     NIFTYINDEXTOKEN,
     SENSEXINDEXTOKEN,
     VIXINDEXTOKEN,
+    HOOK_DETECTION_TIME,
+    BREAKOUT_WAIT_MINUTES,
 )
 from strategy import (
     findentryidx,
@@ -44,7 +50,6 @@ from strategy import (
     processnormal,
 )
 from smartapi_helpers import (
-    # data helpers
     getindex1min,
     get_orb_breakout_15min,
     get_midday_orb_breakout_15min,
@@ -53,9 +58,6 @@ from smartapi_helpers import (
     calc_atm_strikes,
     get_previous_day_high_low,
     check_breakout,
-    # order helpers yahan se ab local use honge
-    # place_market_order,
-    # exit_position,
 )
 from models import (
     AccountConfig,
@@ -65,33 +67,38 @@ from models import (
     SimpleVixConfig,
     LiveTradeSimpleRequest,
 )
-from typing import List, Dict
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.date import DateTrigger
-import sys
-from pathlib import Path
+
 from typing import Dict, Any, List, Optional, Literal
+from pathlib import Path
+import sys
 import os
 import json
+import logging
+
 import pandas as pd
-import openpyxl  # Gann Excel ke liye
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from datetime import datetime, timedelta, time
 import numpy as np
-from typing import Optional  # upar imports me ensure kar lo
-from expiry_store import refresh_and_get_expiries
+import openpyxl  # Gann Excel ke liye
 import xlwings as xw
 import pyotp
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
+
+from datetime import datetime, timedelta, time
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
+
 from SmartApi import SmartConnect
 from SmartApi import smartConnect as smart_module
-import logging
-from jumpback_rule import decide_orb_or_jumpback
 import SmartApi.smartConnect as smart_mod
-from fastapi.responses import PlainTextResponse
+
+from expiry_store import refresh_and_get_expiries
+from jumpback_rule import decide_orb_or_jumpback
 from price_rounding import round_index_price_for_side
-from bot3_high_vol_rule import run_bot3_entry_engine
-import os
+from bot3_high_vol_rule import run_bot3_high_vol_strategy
+from trading_state import bot_state
 
 
 # ===== Globals =====
@@ -1095,9 +1102,29 @@ def run_v2_orb_gann_backtest_logic(
 ) -> Dict[str, Any]:
     """
     10:00 ORB + Gann backtest logic.
-    Agar 10:00 ORB breakout ke waqt tak previous day H/L break nahi hua,
-    to yeh bot trade nahi lega, status = JUMP_TO_915_ORB dega.
+    BACKTEST MODE me yahan 9:30 hook/unhook detection bhi hota hai.
     """
+
+    # ===== BACKTEST HOOK / UNHOOK LOGIC =====
+    bot_state.hook_detected = False
+    bot_state.is_hooked = False
+
+    hook_info: Dict[str, Any] = {}
+
+    print("[HOOK] BACKTEST hook detection start")
+    hook_info = detect_hook_930_exact(api, v1req.date)
+    bot_state.hook_detected = True
+    bot_state.is_hooked = hook_info.get("is_hooked", True)
+    bot_state.breakout_level = hook_info.get("breakout_level", 0.0)
+    print("[HOOK] result:", hook_info)
+
+    # Sirf log karo, return mat karo - baaki flow normal chalega
+    if hook_info.get("hook_status") == "UNHOOKED":
+        print(
+            f"[HOOK] UNHOOKED DAY detected: gap_dir={hook_info.get('gap_direction')} "
+            f"dist={hook_info.get('distance_rs')} Rs – "
+            "normal ORB+Gann flow continue karega"
+        )
 
     # -------- NIFTY + SENSEX 1-min DATA --------
     nifty_idxdf = getindex1min(api, v1req.date, symboltoken=NIFTYINDEXTOKEN)
@@ -2401,6 +2428,23 @@ def run_live_loop_for_account(api, acc, date: str, expiry: str):
 
     while True:
         now = datetime.now()
+
+        # -------- LIVE 9:30 HOOK / UNHOOK LOGIC --------
+        if (not bot_state.hook_detected
+                and now.time() >= HOOK_DETECTION_TIME):
+            print("[HOOK] LIVE 9:30 hook detection start")
+            hook_info = detect_hook_930_exact(api, date)
+            bot_state.hook_detected = True
+            bot_state.is_hooked = hook_info.get("is_hooked", False)
+            bot_state.breakout_level = hook_info.get("breakout_level", 0.0)
+            print("[HOOK] LIVE result:", hook_info)
+
+        # Agar UNHOOKED hai aur abhi breakout+1hr logic nahi dala,
+        # to filhaal koi entry mat lo.
+        if bot_state.hook_detected and not bot_state.is_hooked:
+            time.sleep(60)
+            continue
+
         # Market time window
         if now.time() < time(9, 15):
             # market open ka wait
@@ -2433,7 +2477,8 @@ def run_live_loop_for_account(api, acc, date: str, expiry: str):
 
         if strat.get("status") not in ("ok", "GAP_DAY"):
             print(
-                f"[LIVE-LOOP] strategy status={strat.get('status')} msg={strat.get('message')}")
+                f"[LIVE-LOOP] strategy status={strat.get('status')} msg={strat.get('message')}"
+            )
             time.sleep(30)
             continue
 
@@ -2450,7 +2495,11 @@ def run_live_loop_for_account(api, acc, date: str, expiry: str):
         lots = v1req.lots or 1
 
         # Agar abhi tak entry nahi li aur primary ready hai
-        if (not entry_taken) and primary.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
+        if (not entry_taken) and primary.get("status") not in (
+            None,
+            "NOENTRY",
+            "NO_ENTRY",
+        ):
             if not index_mode:
                 primary_token = cetoken if primary_side == "BUY" else petoken
             else:
@@ -2465,7 +2514,7 @@ def run_live_loop_for_account(api, acc, date: str, expiry: str):
                     transactiontype=primary_side,  # BUY/SELL
                     quantity=qty,
                     exchange="NFO",
-                    product="MIS",                 # 🔥 intraday
+                    product="MIS",  # intraday
                     ordertype="MARKET",
                     variety="NORMAL",
                 )
@@ -2476,7 +2525,8 @@ def run_live_loop_for_account(api, acc, date: str, expiry: str):
 
             else:
                 print(
-                    f"[LIVE-LOOP] INDEX MODE, no option order for {acc.name}")
+                    f"[LIVE-LOOP] INDEX MODE, no option order for {acc.name}"
+                )
                 entry_taken = True  # index mode, aage exit check skip
 
         # Agar entry ho chuki hai, exit check karo
@@ -2498,14 +2548,17 @@ def run_live_loop_for_account(api, acc, date: str, expiry: str):
                 hit_sl = sl > 0 and ltp >= sl
 
             print(
-                f"[LIVE-LOOP] LTP={ltp} tgt={tgt} sl={sl} side={primary_side} hit_tgt={hit_target} hit_sl={hit_sl}")
+                f"[LIVE-LOOP] LTP={ltp} tgt={tgt} sl={sl} "
+                f"side={primary_side} hit_tgt={hit_target} hit_sl={hit_sl}"
+            )
 
             if hit_target or hit_sl:
                 qty = lots * 65
                 exitorder_res = exit_position(
                     api, primary_token, primary_side, qty)
                 print(
-                    f"[LIVE-LOOP] EXIT {primary_side} {qty} for {acc.name}: {exitorder_res}")
+                    f"[LIVE-LOOP] EXIT {primary_side} {qty} for {acc.name}: {exitorder_res}"
+                )
                 exit_done = True
                 break
 
@@ -3050,7 +3103,7 @@ def cancel_schedule(req: LiveScheduleCancel):
 
 if __name__ == "__main__":
     do_live_trade_for_account(
-        account_name="YOUR_ACCOUNT_NAME",  # yahan apna actual account name
+        account_name="MAIN",        # ya dusra naam agar woh use karna ho
         date="2026-02-24",
         expiry="2026-02-24",
     )

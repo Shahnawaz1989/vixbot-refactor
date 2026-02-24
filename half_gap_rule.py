@@ -138,3 +138,124 @@ def detect_half_gap(api, nifty_idxdf: pd.DataFrame, trade_date: str) -> Dict[str
         "is_half_gap":   half_type in ("HALF_GAP_UP", "HALF_GAP_DOWN"),
     })
     return base
+
+
+def detect_hook_930_exact(api, trade_date: str) -> Dict[str, Any]:
+    """
+    9:30 Hook Detection (cross/touch logic):
+    - Gap DOWN: today 9:15-9:30 HIGH >= prev last candle LOW  → HOOKED
+    - Gap UP:   today 9:15-9:30 LOW  <= prev last candle HIGH → HOOKED
+    - 10-day lookback for prev day (weekend/holiday handle)
+    """
+
+    # ---------- Prev day last candle (10-day lookback) ----------
+    trade_dt = datetime.strptime(trade_date, "%Y-%m-%d")
+    prev_day = trade_dt - timedelta(days=1)
+    max_lookback = 10
+
+    prev_last = None
+    prev_found_date = None
+
+    for _ in range(max_lookback):
+        fromdt = prev_day.replace(hour=9, minute=15)
+        todt = prev_day.replace(hour=15, minute=30)
+
+        payload = {
+            "exchange": "NSE",
+            "symboltoken": NIFTYINDEXTOKEN,
+            "interval": "ONE_MINUTE",
+            "fromdate": fromdt.strftime("%Y-%m-%d %H:%M"),
+            "todate":   prev_day.replace(hour=15, minute=31).strftime("%Y-%m-%d %H:%M"),
+        }
+
+        hist = api.getCandleData(payload)
+        if hist.get("status") and hist.get("data"):
+            df = pd.DataFrame(
+                hist["data"],
+                columns=["time", "open", "high", "low", "close", "volume"],
+            )
+            df["time"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
+            df = df.set_index("time")
+
+            # Last 15-min candle (15:15–15:30)
+            df15 = df.resample("15min").agg(
+                {"open": "first", "high": "max", "low": "min", "close": "last"}
+            ).dropna()
+
+            prev_last = df15.iloc[-1]
+            prev_found_date = prev_day.date()
+            print(
+                f"[HOOK] Prev day found: {prev_found_date} last 15min candle time={prev_last.name}")
+            break
+
+    prev_close = float(prev_last["close"])
+    prev_high = float(prev_last["high"])
+    prev_low = float(prev_last["low"])
+
+    # ---------- Today 9:15–9:30 ----------
+    today_df = getindex1min(api, trade_date, NIFTYINDEXTOKEN)
+    if today_df.empty:
+        print("[HOOK] NO_TODAY_DATA – treating as HOOKED")
+        return {
+            "hook_status": "NO_TODAY_DATA",
+            "is_hooked": True,
+            "breakout_level": prev_close,
+        }
+
+    t_915 = pd.Timestamp(f"{trade_date} 09:15")
+    t_930 = pd.Timestamp(f"{trade_date} 09:30")
+    today_15m = today_df[(today_df.index >= t_915) & (today_df.index < t_930)]
+
+    if today_15m.empty:
+        print("[HOOK] NO_915_930 – treating as HOOKED")
+        return {
+            "hook_status": "NO_915_930",
+            "is_hooked": True,
+            "breakout_level": prev_close,
+        }
+
+    today_open = float(today_15m["open"].iloc[0])
+    today_high = float(today_15m["high"].max())
+    today_low = float(today_15m["low"].min())
+
+    # ---------- Gap direction ----------
+    if today_open > prev_close:
+        gap_direction = "GAP_UP"
+    else:
+        gap_direction = "GAP_DOWN"
+
+    # ---------- Hook cross/touch logic ----------
+    if gap_direction == "GAP_DOWN":
+        # today HIGH ne prev LOW ko touch/cross kiya?
+        ref_prev = prev_low
+        ref_today = today_high
+        is_hooked = today_high >= prev_low
+
+    else:  # GAP_UP
+        # today LOW ne prev HIGH ko touch/cross kiya?
+        ref_prev = prev_high
+        ref_today = today_low
+        is_hooked = today_low <= prev_high
+
+    distance = abs(ref_prev - ref_today)
+    hook_status = "HOOKED" if is_hooked else "UNHOOKED"
+
+    print(
+        f"[HOOK] 9:30 CHECK gap_dir={gap_direction} "
+        f"prev_ref={ref_prev} today_ref={ref_today} "
+        f"dist={distance:.2f} status={hook_status}"
+    )
+
+    return {
+        "hook_status": hook_status,
+        "gap_direction": gap_direction,
+        "prev_ref": ref_prev,
+        "today_ref": ref_today,
+        "distance_rs": round(distance, 2),
+        "is_hooked": is_hooked,
+        "breakout_level": ref_prev,
+        "prev_close": prev_close,
+        "prev_high": prev_high,
+        "prev_low": prev_low,
+        "today_open": today_open,
+    }
