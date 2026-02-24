@@ -1,15 +1,5 @@
 # smartapi_helpers.py
 
-from typing import Tuple  # top pe
-from datetime import datetime, timedelta, time as dtime
-from typing import Optional, Dict, Any
-
-import pandas as pd
-from SmartApi import SmartConnect
-from price_rounding import round_index_price_for_side
-import pyotp
-import json
-
 from config import (
     APIKEY,
     CLIENTID,
@@ -21,6 +11,16 @@ from config import (
     MARKING_START,
     MARKING_END,
 )
+from typing import Optional, Tuple, Dict, Any
+from datetime import datetime, timedelta, time as dtime
+
+import pandas as pd
+from SmartApi import SmartConnect
+from price_rounding import round_index_price_for_side
+import pyotp
+import json
+
+DRY_RUN = True  # 🔁 test ke liye True, real trade ke liye False
 
 # ========== SMARTAPI LOGIN ==========
 
@@ -34,8 +34,8 @@ def smartlogin() -> Optional[SmartConnect]:
         return None
     return api
 
-
 # ========== INDEX DATA (1-MIN) ==========
+
 
 def getindex1min(
     api: SmartConnect,
@@ -495,6 +495,64 @@ def getoptiontoken(strike: int, expiry: str, opttype: str) -> Optional[str]:
         return None
 
 
+def getoptiontoken_and_symbol(
+    strike: int, expiry: str, opttype: str
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    NIFTY option ke liye token + tradingsymbol (symbol) return karega.
+    Same logic as getoptiontoken, bas extra symbol bhi nikal raha hai.
+    """
+    try:
+        with open(SCRIPMASTERFILE, "r") as f:
+            data = json.load(f)
+
+        records = data if isinstance(data, list) else data.get("data", [])
+
+        strike_in_file_units = float(strike) * 100.0
+        expirycode = datetime.strptime(
+            expiry, "%Y-%m-%d"
+        ).strftime("%d%b%Y").upper()
+
+        print(
+            "DEBUG getoptiontoken_and_symbol: strike_idx",
+            strike,
+            "strike_file",
+            strike_in_file_units,
+            "expirycode",
+            expirycode,
+            "type",
+            opttype,
+        )
+
+        for row in records:
+            if (
+                row.get("exch_seg") == "NFO"
+                and row.get("name") == "NIFTY"
+                and row.get("instrumenttype") == "OPTIDX"
+                and row.get("symbol", "").endswith(opttype.upper())
+            ):
+                row_strike = float(row.get("strike", 0.0))
+                row_expiry = (row.get("expiry") or "").upper()
+
+                if row_strike == strike_in_file_units and row_expiry == expirycode:
+                    sym = str(row.get("symbol"))
+                    tok = str(row.get("token"))
+                    print("DEBUG token+symbol hit:",
+                          sym, row_strike, row_expiry)
+                    return tok, sym
+
+        print(
+            "DEBUG token+symbol not found for",
+            strike_in_file_units,
+            expirycode,
+            opttype,
+        )
+        return None, None
+    except Exception as e:
+        print("getoptiontoken_and_symbol error", e)
+        return None, None
+
+
 def getoption1min(api: SmartConnect, token: str, tradedate: str) -> pd.DataFrame:
     d = datetime.strptime(tradedate, "%Y-%m-%d")
     fromdt = d.replace(hour=9, minute=15)
@@ -542,7 +600,7 @@ def place_market_order(
     transactiontype: str,
     quantity: int,
     exchange: str = "NFO",
-    product: str = "NRML",
+    product: str = "MIS",      # default MIS
     ordertype: str = "MARKET",
     variety: str = "NORMAL",
 ) -> dict:
@@ -564,8 +622,13 @@ def place_market_order(
             "stoploss": 0,
             "trailingStopLoss": 0,
         }
-
         print("[ORDER-REQ TIME]", datetime.now(), payload)
+
+        # 🔹 DRY-RUN MODE
+        if DRY_RUN:
+            print("[DRY-RUN ORDER] (no API call)")
+            return {"status": True, "message": "DRY-RUN", "raw": payload}
+
         try:
             res = api.placeOrder(payload)
         except Exception as inner:
@@ -573,7 +636,6 @@ def place_market_order(
             return {"status": "error", "message": str(inner)}
 
         print("[RAW ORDER RES]", res)
-
         ok = True
         msg = ""
         if isinstance(res, dict):

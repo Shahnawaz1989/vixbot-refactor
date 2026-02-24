@@ -94,11 +94,6 @@ def run_bot3_method_b(
     bo_ctx: Dict[str, Any],
     gann_map: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Method B – normal ORB-style mapping.
-    - BO candle ke side ke hisaab se primary leg H8/N8.
-    - Hedge leg J8/M8 simple.
-    """
     tradedate = bo_ctx["trade_date"]
     boside = bo_ctx["boside"]
     atr15_915 = bo_ctx["atr15_915"]
@@ -110,23 +105,28 @@ def run_bot3_method_b(
         primary_key = "N8"
         hedge_key = "M8"
 
-    primary_entry = gann_map.get(primary_key)
-    hedge_entry = gann_map.get(hedge_key)
+    primary_entry_raw = gann_map.get(primary_key)
+    hedge_entry_raw = gann_map.get(hedge_key)
 
-    # ✅ FIX 5: Rounding for Method B also
+    # agar level hi missing hai to yahin SKIP
+    if primary_entry_raw is None or hedge_entry_raw is None:
+        print(
+            f"[BOT3-METHOD-B] {tradedate} boside={boside} "
+            f"missing gann levels: {primary_key}={primary_entry_raw} "
+            f"{hedge_key}={hedge_entry_raw}"
+        )
+        return {"status": "SKIP_METHOD_B", "reason": "MISSING_GANN_LEVELS"}
+
     primary_entry = round_index_price_for_side(
-        float(primary_entry), "BUY" if boside == "BUY" else "SELL")
+        float(primary_entry_raw), "BUY" if boside == "BUY" else "SELL")
     hedge_entry = round_index_price_for_side(
-        float(hedge_entry), "SELL" if boside == "BUY" else "BUY")
+        float(hedge_entry_raw), "SELL" if boside == "BUY" else "BUY")
 
     print(
         f"[BOT3-METHOD-B] {tradedate} boside={boside} "
         f"primary={primary_key}={primary_entry} hedge={hedge_key}={hedge_entry} "
         f"atr15_915={atr15_915:.2f}"
     )
-
-    if primary_entry is None or hedge_entry is None:
-        return {"status": "SKIP_METHOD_B", "reason": "MISSING_GANN_LEVELS"}
 
     return {
         "status": "OK_METHOD_B",

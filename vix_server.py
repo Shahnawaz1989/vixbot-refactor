@@ -889,12 +889,12 @@ def place_market_order(
     """
     payload = {
         "variety": "NORMAL",
-        "tradingsymbol": "NIFTY",
+        "tradingsymbol": "NIFTY",      # tumhare token se expiry+strike map hoti hai
         "symboltoken": token,
-        "transactiontype": side,   # "BUY" / "SELL"
+        "transactiontype": side,       # "BUY" / "SELL"
         "exchange": "NFO",
         "ordertype": "MARKET",
-        "producttype": "NRML",
+        "producttype": "NRML",         # ya MIS agar tum intraday chahte ho
         "duration": "DAY",
         "quantity": qty,
         "price": "0",
@@ -906,47 +906,18 @@ def place_market_order(
     print(f"[ORDER REQ] {side} {qty} @ {token} payload={payload}")
     try:
         res = api.placeOrder(payload)
-        print(f"[ORDER RES RAW] {side} {qty} @ {token}: {res}")
+        print(f"[ORDER RES] {side} {qty} @ {token}: {res}")
 
-        # Normalise SmartAPI response
-        status = False
-        msg = ""
-        order_id = None
-
+        # SmartAPI kabhi string order id, kabhi dict deta hai
         if isinstance(res, str):
-            # often plain order id string
-            status = True
-            order_id = res
-            msg = res
-        elif isinstance(res, dict):
-            status = bool(res.get("status", True))
-            # SmartAPI kabhi-kabhi "data" me order id deta hai
-            data = res.get("data") or {}
-            if isinstance(data, dict):
-                order_id = data.get("orderid") or data.get("order_id")
-            # best-effort message
-            msg = (
-                res.get("message")
-                or res.get("error")
-                or res.get("errorMsg")
-                or str(res)
-            )
-        else:
-            # unknown type
-            msg = str(res)
-
-        if not status:
-            print(f"[ORDER ERROR] {side} {qty} @ {token}: {msg}")
-
-        return {
-            "status": status,
-            "message": msg,
-            "orderid": order_id,
-            "raw": res,
-        }
+            return {"status": True, "orderid": res}
+        # dict me status flag nahi ho to bhi normalize kar lo
+        if isinstance(res, dict) and "status" not in res:
+            res = {"status": True, **res}
+        return res
     except Exception as e:
-        print(f"[ORDER EXCEPTION] {side} {qty} @ {token}: {e}")
-        return {"status": False, "message": str(e), "raw": None}
+        print(f"[ORDER ERROR] {side} {qty} @ {token}: {e}")
+        return {"status": False, "message": str(e)}
 
 
 def exit_position(
@@ -955,13 +926,16 @@ def exit_position(
     side: str,
     qty: int,
 ) -> Dict[str, Any]:
-    exitside = "SELL" if side == "BUY" else "BUY"
-
+    """
+    Existing position exit kare:
+    - Agar entry BUY thi to yahan side='BUY' doge, ye SELL karega.
+    - Agar entry SELL thi to yahan side='SELL', ye BUY karega.
+    """
     payload = {
         "variety": "NORMAL",
         "tradingsymbol": "NIFTY",
         "symboltoken": token,
-        "transactiontype": exitside,
+        "transactiontype": "SELL" if side == "BUY" else "BUY",
         "exchange": "NFO",
         "ordertype": "MARKET",
         "producttype": "NRML",
@@ -976,42 +950,15 @@ def exit_position(
     print(f"[EXIT REQ] {side} {qty} @ {token} payload={payload}")
     try:
         res = api.placeOrder(payload)
-        print(f"[EXIT RES RAW] {side} {qty} @ {token}: {res}")
-
-        status = False
-        msg = ""
-        order_id = None
-
+        print(f"[EXIT RES] {side} {qty} @ {token}: {res}")
         if isinstance(res, str):
-            status = True
-            order_id = res
-            msg = res
-        elif isinstance(res, dict):
-            status = bool(res.get("status", True))
-            data = res.get("data") or {}
-            if isinstance(data, dict):
-                order_id = data.get("orderid") or data.get("order_id")
-            msg = (
-                res.get("message")
-                or res.get("error")
-                or res.get("errorMsg")
-                or str(res)
-            )
-        else:
-            msg = str(res)
-
-        if not status:
-            print(f"[EXIT ERROR] {side} {qty} @ {token}: {msg}")
-
-        return {
-            "status": status,
-            "message": msg,
-            "orderid": order_id,
-            "raw": res,
-        }
+            return {"status": True, "orderid": res}
+        if isinstance(res, dict) and "status" not in res:
+            res = {"status": True, **res}
+        return res
     except Exception as e:
-        print(f"[EXIT EXCEPTION] {side} {qty} @ {token}: {e}")
-        return {"status": False, "message": str(e), "raw": None}
+        print(f"[EXIT ERROR] {side} {qty} @ {token}: {e}")
+        return {"status": False, "message": str(e)}
 
 
 def get_live_option_ltp(api: SmartConnect, token: str) -> float:
@@ -2512,9 +2459,19 @@ def run_live_loop_for_account(api, acc, date: str, expiry: str):
             if not index_mode and primary_token:
                 qty = lots * 65
                 entryorder_res = place_market_order(
-                    api, primary_token, primary_side, qty)
+                    api=api,
+                    tradingsymbol="NIFTY",
+                    symboltoken=primary_token,
+                    transactiontype=primary_side,  # BUY/SELL
+                    quantity=qty,
+                    exchange="NFO",
+                    product="MIS",                 # 🔥 intraday
+                    ordertype="MARKET",
+                    variety="NORMAL",
+                )
                 print(
-                    f"[LIVE-LOOP] ENTRY {primary_side} {qty} for {acc.name}: {entryorder_res}")
+                    f"[LIVE-LOOP] ENTRY {primary_side} {qty} for {acc.name}: {entryorder_res}"
+                )
                 entry_taken = True
 
             else:
@@ -2637,7 +2594,7 @@ def do_live_trade_for_account(account_name: str, date: str, expiry: str):
                 transactiontype=primary_side,
                 quantity=qty,
                 exchange="NFO",
-                product="NRML",
+                product="MIS",
                 ordertype="MARKET",
                 variety="NORMAL",
             )
@@ -2859,12 +2816,20 @@ def live_trade(req: LiveTradeSimpleRequest) -> Dict[str, Any]:
                 transactiontype=primary_side,
                 quantity=qty,
                 exchange="NFO",
-                product="NRML",
+                product="MIS",
                 ordertype="MARKET",
                 variety="NORMAL",
             )
+            print(
+                f"[AUTO LIVE] ENTRY {primary_side} {qty} for {acc.name}: {entryorder_res}")
+
             exitorder_res = exit_position(
                 api, primary_token, primary_side, qty)
+
+            print(
+                f"[AUTO LIVE] EXIT {primary_side} {qty} for {acc.name}: {exitorder_res}")
+
+            print(f"[AUTO LIVE] INDEX MODE, no option order for {acc.name}")
 
         return {
             "status": "ok",
@@ -3080,4 +3045,12 @@ def cancel_schedule(req: LiveScheduleCancel):
         message="cancelled",
         schedule_id=schedule_id,
         run_at=SCHEDULE_STORE.get(schedule_id, {}).get("run_at"),
+    )
+
+
+if __name__ == "__main__":
+    do_live_trade_for_account(
+        account_name="YOUR_ACCOUNT_NAME",  # yahan apna actual account name
+        date="2026-02-24",
+        expiry="2026-02-24",
     )
