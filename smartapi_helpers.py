@@ -20,7 +20,30 @@ from price_rounding import round_index_price_for_side
 import pyotp
 import json
 
+
+def _normalize_expiry_to_code(expiry: str) -> Optional[str]:
+    """
+    expiry ko '%Y-%m-%d' ya '%d%b%Y' se normalize karke '%d%b%Y' (e.g. '02MAR2026') banata hai.
+    Galat string (jaise 'PE') aaye to None return karega.
+    """
+    if not expiry:
+        return None
+
+    expiry = expiry.strip().upper()
+
+    # Already like '02MAR2026'
+    if len(expiry) == 9 and expiry[0:2].isdigit() and expiry[2:5].isalpha():
+        return expiry
+
+    # Try 'YYYY-MM-DD'
+    try:
+        return datetime.strptime(expiry, "%Y-%m-%d").strftime("%d%b%Y").upper()
+    except Exception:
+        return None
+
+
 DRY_RUN = True  # 🔁 test ke liye True, real trade ke liye False
+
 
 # ========== SMARTAPI LOGIN ==========
 
@@ -462,8 +485,10 @@ def getoptiontoken(strike: int, expiry: str, opttype: str) -> Optional[str]:
         records = data if isinstance(data, list) else data.get("data", [])
 
         strike_in_file_units = float(strike) * 100.0
-        expirycode = datetime.strptime(
-            expiry, "%Y-%m-%d").strftime("%d%b%Y").upper()
+        expirycode = _normalize_expiry_to_code(expiry)
+        if not expirycode:
+            print("getoptiontoken error: invalid expiry:", expiry)
+            return None
 
         print(
             "DEBUG getoptiontoken: strike_idx", strike,
@@ -475,7 +500,7 @@ def getoptiontoken(strike: int, expiry: str, opttype: str) -> Optional[str]:
         for row in records:
             if (
                 row.get("exch_seg") == "NFO"
-                and row.get("name") == "NIFTY"
+                and row.get("name") == "NIFTY"           # NIFTY index options
                 and row.get("instrumenttype") == "OPTIDX"
                 and row.get("symbol", "").endswith(opttype.upper())
             ):
@@ -500,18 +525,17 @@ def getoptiontoken_and_symbol(
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     NIFTY option ke liye token + tradingsymbol (symbol) return karega.
-    Same logic as getoptiontoken, bas extra symbol bhi nikal raha hai.
     """
     try:
         with open(SCRIPMASTERFILE, "r") as f:
             data = json.load(f)
-
         records = data if isinstance(data, list) else data.get("data", [])
 
         strike_in_file_units = float(strike) * 100.0
-        expirycode = datetime.strptime(
-            expiry, "%Y-%m-%d"
-        ).strftime("%d%b%Y").upper()
+        expirycode = _normalize_expiry_to_code(expiry)
+        if not expirycode:
+            print("getoptiontoken_and_symbol error: invalid expiry:", expiry)
+            return None, None
 
         print(
             "DEBUG getoptiontoken_and_symbol: strike_idx",

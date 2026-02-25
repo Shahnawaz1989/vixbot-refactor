@@ -1578,6 +1578,32 @@ def run_v2_orb_gann_backtest_logic(
 
     base_idxdf = full_idxdf[full_idxdf.index >= entry_start_time].copy()
 
+    # -------- UNHOOKED DAY OPP LEG 1-HOUR DELAY --------
+    # Default: no extra delay
+    buy_window_start = entry_start_time
+    sell_window_start = entry_start_time
+
+    # Sirf UNHOOKED din pe (hooked ka koi special rule nahi)
+    if not bot_state.is_hooked and trigger_time is not None and orb_mode == "MORNING":
+        # Breakout side = primary; opposite side ke liye 1 hour wait
+        opp_delay_start = trigger_time + timedelta(hours=1)
+
+        if trigger_side == "BUY":
+            # Primary = BUY, Opp = SELL -> SELL window 1 hour baad se
+            sell_window_start = max(entry_start_time, opp_delay_start)
+        elif trigger_side == "SELL":
+            # Primary = SELL, Opp = BUY -> BUY window 1 hour baad se
+            buy_window_start = max(entry_start_time, opp_delay_start)
+
+        print(
+            "[UNHOOK-OPP-DELAY]",
+            "is_hooked=", bot_state.is_hooked,
+            "trigger_side=", trigger_side,
+            "trigger_time=", trigger_time,
+            "buy_start=", buy_window_start,
+            "sell_start=", sell_window_start,
+        )
+
     # -------- CHOTI DAY ENTRY WINDOWS (2h / 1h) --------
     if orb_mode == "MORNING" and is_choti_day and trigger_time is not None:
         timer_start = trigger_time
@@ -1592,11 +1618,11 @@ def run_v2_orb_gann_backtest_logic(
             buy_window_end = timer_start + timedelta(hours=1, minutes=15)
 
         idxdf_buy_window = base_idxdf[
-            (base_idxdf.index >= entry_start_time)
+            (base_idxdf.index >= buy_window_start)
             & (base_idxdf.index <= buy_window_end)
         ].copy()
         idxdf_sell_window = base_idxdf[
-            (base_idxdf.index >= entry_start_time)
+            (base_idxdf.index >= sell_window_start)
             & (base_idxdf.index <= sell_window_end)
         ].copy()
 
@@ -1604,12 +1630,16 @@ def run_v2_orb_gann_backtest_logic(
             "[CHOTI-WINDOW]",
             "trigger_side=", trigger_side,
             "start=", entry_start_time,
+            "buy_start=", buy_window_start,
+            "sell_start=", sell_window_start,
             "buy_end=", buy_window_end,
             "sell_end=", sell_window_end,
         )
     else:
-        idxdf_buy_window = base_idxdf.copy()
-        idxdf_sell_window = base_idxdf.copy()
+        idxdf_buy_window = base_idxdf[base_idxdf.index >=
+                                      buy_window_start].copy()
+        idxdf_sell_window = base_idxdf[base_idxdf.index >=
+                                       sell_window_start].copy()
 
     # DEFAULTBOSTART filter
     bot = DEFAULTBOSTART
@@ -1672,8 +1702,17 @@ def run_v2_orb_gann_backtest_logic(
         cestrike = round_to_nearest_50(ce_raw)
         pestrike = round_to_nearest_50(pe_raw)
 
-        cetoken = getoptiontoken(cestrike, v1req.expiry, "CE")
-        petoken = getoptiontoken(pestrike, v1req.expiry, "PE")
+        # Expiry ko clean date string ensure karo (YYYY-MM-DD)
+        expiry_raw = (v1req.expiry or "").strip()
+        # Agar galti se "CE"/"PE" aa gaya ho to usko ignore karo
+        if expiry_raw in ("CE", "PE"):
+            print("WARNING: v1req.expiry was",
+                  expiry_raw, "resetting to trade date")
+            expiry_raw = v1req.date  # fallback: index trade date
+
+        cetoken = getoptiontoken(cestrike, expiry_raw, "CE")
+        petoken = getoptiontoken(pestrike, expiry_raw, "PE")
+
         movement = 0.0
         if not cetoken or not petoken:
             return {
@@ -2180,8 +2219,16 @@ def run_915_orb_gann_backtest_logic(
         cestrike = round_to_nearest_50(ce_raw)
         pestrike = round_to_nearest_50(pe_raw)
 
-        cetoken = getoptiontoken(cestrike, v1req.expiry, "CE")
-        petoken = getoptiontoken(pestrike, "PE", v1req.expiry)
+        # Expiry ko clean date string ensure karo (YYYY-MM-DD)
+        expiry_raw = (v1req.expiry or "").strip()
+        # Agar galti se "CE"/"PE" aa gaya ho to trade date use karo
+        if expiry_raw in ("CE", "PE", ""):
+            print("WARNING: v1req.expiry was", repr(
+                expiry_raw), "resetting to trade date")
+            expiry_raw = v1req.date
+
+        cetoken = getoptiontoken(cestrike, expiry_raw, "CE")
+        petoken = getoptiontoken(pestrike, expiry_raw, "PE")
     else:
         cestrike = 0
         pestrike = 0
