@@ -97,9 +97,20 @@ import SmartApi.smartConnect as smart_mod
 from expiry_store import refresh_and_get_expiries
 from jumpback_rule import decide_orb_or_jumpback
 from price_rounding import round_index_price_for_side
-from bot3_high_vol_rule import run_bot3_high_vol_strategy
+from bot3_high_vol_rule import (
+    run_bot3_high_vol_strategy,
+    run_bot3_entry_engine,
+)
 from trading_state import bot_state
 
+from config import BOT3_HIGH_VOL_THRESHOLD
+
+from bot3_high_vol_rule import run_bot3_high_vol_strategy
+
+from trade_state_engine import TradingState
+from order_engine import place_option_buy
+
+trading_state = TradingState()
 
 # ===== Globals =====
 LAST_MANUAL_MONITOR_RUN: Optional[str] = None
@@ -711,16 +722,50 @@ def vixbacktest(req: VixV2Request) -> Dict[str, Any]:
         class DummyAcc:
             def __init__(self, name: str) -> None:
                 self.name = name
-
         fake_acc = DummyAcc("BACKTEST")
 
-    # Single source of truth: full engine yahin se chalega
+    # ---- BOT-3 HIGH-VOL GATE ----
+    if is_bot3_high_vol_day(api, v1req.date):
+        print("[BOT3] High-vol day detected → Bot-3 ONLY mode")
+
+        nifty_idxdf = getindex1min(
+            api, v1req.date, symboltoken=NIFTYINDEXTOKEN)
+        if nifty_idxdf.empty:
+            return {"status": "error", "message": "No NIFTY data for Bot-3"}
+        nifty_idxdf.index = pd.to_datetime(nifty_idxdf.index)
+        full_idxdf = nifty_idxdf.copy()
+
+        daily_df = (
+            full_idxdf
+            .resample("1D")
+            .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+            .dropna()
+            .reset_index()
+        )
+        daily_df = daily_df.rename(columns={"index": "date"})
+
+        bot3_result = run_bot3_high_vol_strategy(
+            idxdf_daily=daily_df,
+            idxdf_1min=full_idxdf,
+            trade_date=v1req.date,
+            gann_levels={},  # engine andar se JSON se lega
+        )
+
+        return {
+            "status": bot3_result.get("status", "BOT3_DONE"),
+            "mode": "BOT3_ONLY",
+            "bot3": bot3_result,
+        }
+
+    # ---- NORMAL FLOW (Bot-1 / Bot-2 / 9:15 etc.) ----
     result = run_v2_orb_gann_backtest_logic(api, fake_acc, v1req)
 
     if result.get("status") == "JUMP_TO_915_ORB":
         jump_decision_time = result.get("jump_decision_time")
-        print("[V2-ENDPOINT] Switching to 9:15 ORB bot, fallback_after_time=",
-              jump_decision_time)
+        print(
+            "[V2-ENDPOINT] Switching to 9:15 ORB bot, fallback_after_time=",
+            jump_decision_time,
+        )
         result = run_915_orb_gann_backtest_logic(
             api,
             fake_acc,
@@ -930,41 +975,34 @@ def place_market_order(
 def exit_position(
     api: SmartConnect,
     token: str,
+    symbol: str,
     side: str,
     qty: int,
 ) -> Dict[str, Any]:
-    """
-    Existing position exit kare:
-    - Agar entry BUY thi to yahan side='BUY' doge, ye SELL karega.
-    - Agar entry SELL thi to yahan side='SELL', ye BUY karega.
-    """
+
     payload = {
         "variety": "NORMAL",
-        "tradingsymbol": "NIFTY",
+        "tradingsymbol": symbol,  # FIXED (no hardcoded NIFTY)
         "symboltoken": token,
         "transactiontype": "SELL" if side == "BUY" else "BUY",
         "exchange": "NFO",
         "ordertype": "MARKET",
-        "producttype": "NRML",
+        "producttype": "INTRADAY",  # FIXED
         "duration": "DAY",
         "quantity": qty,
-        "price": "0",
-        "triggerprice": "0",
-        "squareoff": "0",
-        "stoploss": "0",
+        "price": 0,
+        "squareoff": 0,
+        "stoploss": 0,
     }
 
-    print(f"[EXIT REQ] {side} {qty} @ {token} payload={payload}")
+    print(f"[EXIT REQ] {side} {qty} {symbol}")
+
     try:
         res = api.placeOrder(payload)
-        print(f"[EXIT RES] {side} {qty} @ {token}: {res}")
-        if isinstance(res, str):
-            return {"status": True, "orderid": res}
-        if isinstance(res, dict) and "status" not in res:
-            res = {"status": True, **res}
-        return res
+        print(f"[EXIT RES] {res}")
+        return {"status": True, "orderid": res}
     except Exception as e:
-        print(f"[EXIT ERROR] {side} {qty} @ {token}: {e}")
+        print(f"[EXIT ERROR] {e}")
         return {"status": False, "message": str(e)}
 
 
@@ -1094,6 +1132,35 @@ class LiveScheduleResponse(BaseModel):
 # ========= REAL LIVE TRADE ENDPOINT (V2 ENGINE) =========
 # 1) PURE STRATEGY HELPER (backtest logic yahan shift)
 
+def is_bot3_high_vol_day(api, trade_date) -> bool:
+    """
+    Prev day HL/ATR > BOT3_HIGH_VOL_THRESHOLD?
+    True → Bot-3 only day.
+    """
+    daily_hist = get_nifty_daily_history_for_atr(api, trade_date)
+    if daily_hist is None:
+        print("[BOT3-HIGHVOL] daily_hist is None")
+        return False
+
+    prev_row = calculate_daily_atr_and_ratio(daily_hist)
+    if prev_row is None:
+        print("[BOT3-HIGHVOL] insufficient daily history")
+        return False
+
+    prev_high = float(prev_row["high"])
+    prev_low = float(prev_row["low"])
+    prev_atr = float(prev_row["atr"])
+    prev_range = prev_high - prev_low
+    prev_ratio = float(prev_row["ratio"])
+
+    print(
+        f"[BOT3-HIGHVOL] prev_date={prev_row['date']} "
+        f"range={prev_range:.2f} atr14={prev_atr:.2f} ratio={prev_ratio:.2f} "
+        f"threshold={BOT3_HIGH_VOL_THRESHOLD}"
+    )
+
+    return prev_ratio > BOT3_HIGH_VOL_THRESHOLD
+
 
 def run_v2_orb_gann_backtest_logic(
     api,
@@ -1145,40 +1212,32 @@ def run_v2_orb_gann_backtest_logic(
     )
     daily_df = daily_df.rename(columns={"index": "date"})
 
-    prev_row_df = calculate_daily_atr_and_ratio(daily_df)
+    is_high_vol_day = False  # FLAG
 
+    # DAILY DF ATR block ko sirf logging rakho:
+    prev_row_df = calculate_daily_atr_and_ratio(daily_df)
     if prev_row_df is not None:
         prev_ratio_df = float(prev_row_df["ratio"])
         print(f"[ATR REGIME] prev HL/ATR = {prev_ratio_df:.2f}")
-        if prev_ratio_df > 1.4999:
-            print(
-                f"🚨 HIGH_VOL regime: prev day HL/ATR = {prev_ratio_df:.2f} → BOT-3 ONLY"
-            )
-            return run_bot3_high_vol_strategy(
-                idxdf_daily=daily_df,
-                idxdf_1min=nifty_idxdf,
-                trade_date=v1req.date,
-                gann_levels=bot3_gann_levels,
-            )
     else:
         print("[ATR REGIME] skip: insufficient daily data for ATR")
 
-    # -------- ATR REGIME USING DAILY HISTORY (Angel) - LOGGING ONLY --------
+    # -------- ATR REGIME USING DAILY HISTORY (NEW) – LOG + FALLBACK FLAG --------
     daily_hist = get_nifty_daily_history_for_atr(api, v1req.date)
     if daily_hist is None:
         print("[ATR-REGIME-DAILY] daily_hist is None")
     else:
         print("[ATR-REGIME-DAILY] rows:", len(daily_hist))
-        prev_row_hist = calculate_daily_atr_and_ratio(daily_hist)
-        if prev_row_hist is not None:
-            prev_high = float(prev_row_hist["high"])
-            prev_low = float(prev_row_hist["low"])
-            prev_atr = float(prev_row_hist["atr"])
+        prev_row = calculate_daily_atr_and_ratio(daily_hist)
+        if prev_row is not None:
+            prev_high = float(prev_row["high"])
+            prev_low = float(prev_row["low"])
+            prev_atr = float(prev_row["atr"])
             prev_range = prev_high - prev_low
-            prev_ratio_hist = float(prev_row_hist["ratio"])
+            prev_ratio = float(prev_row["ratio"])
             print(
-                f"[ATR-REGIME-DAILY] prev_date={prev_row_hist['date']} "
-                f"range={prev_range:.2f} atr14={prev_atr:.2f} ratio={prev_ratio_hist:.2f}"
+                f"[ATR-REGIME-DAILY] prev_date={prev_row['date']} "
+                f"range={prev_range:.2f} atr14={prev_atr:.2f} ratio={prev_ratio:.2f}"
             )
         else:
             print("[ATR-REGIME-DAILY] skip: insufficient daily history")
@@ -1483,38 +1542,26 @@ def run_v2_orb_gann_backtest_logic(
         "sell_t4":    float(levels.get("sell_t4",    0.0)),
     }
 
-    # -------- ATR REGIME USING DAILY HISTORY (NEW) --------
+    # -------- ATR REGIME USING DAILY HISTORY (NEW) – LOG ONLY --------
     daily_hist = get_nifty_daily_history_for_atr(api, v1req.date)
     if daily_hist is None:
         print("[ATR-REGIME-DAILY] daily_hist is None")
     else:
         print("[ATR-REGIME-DAILY] rows:", len(daily_hist))
+        prev_row = calculate_daily_atr_and_ratio(daily_hist)
+        if prev_row is not None:
+            prev_high = float(prev_row["high"])
+            prev_low = float(prev_row["low"])
+            prev_atr = float(prev_row["atr"])
+            prev_range = prev_high - prev_low
+            prev_ratio = float(prev_row["ratio"])
 
-    prev_row = calculate_daily_atr_and_ratio(
-        daily_hist) if daily_hist is not None else None
-
-    if prev_row is not None:
-        prev_high = float(prev_row["high"])
-        prev_low = float(prev_row["low"])
-        prev_atr = float(prev_row["atr"])
-        prev_range = prev_high - prev_low
-        prev_ratio = float(prev_row["ratio"])
-
-        print(
-            f"[ATR-REGIME-DAILY] prev_date={prev_row['date']} "
-            f"range={prev_range:.2f} atr14={prev_atr:.2f} ratio={prev_ratio:.2f}"
-        )
-
-        if prev_ratio > 1.4999:
-            print("🚨 HIGH_VOL regime → Bot-3 only")
-            return run_bot3_high_vol_strategy(
-                idxdf_daily=daily_hist,
-                idxdf_1min=nifty_idxdf,
-                trade_date=v1req.date,
-                gann_levels=bot3_gann_levels,
+            print(
+                f"[ATR-REGIME-DAILY] prev_date={prev_row['date']} "
+                f"range={prev_range:.2f} atr14={prev_atr:.2f} ratio={prev_ratio:.2f}"
             )
-    else:
-        print("[ATR-REGIME-DAILY] skip: insufficient daily history")
+        else:
+            print("[ATR-REGIME-DAILY] skip: insufficient daily history")
 
     # -------- ENTRY WINDOW + BOSTART FILTER --------
     trade_date2 = full_idxdf.index[0].date()
@@ -2346,54 +2393,7 @@ def run_915_orb_gann_backtest_logic(
     }
 
 
-# ===== BOT-3 HIGH VOL STRATEGY (NEW) =====
-
-
-def run_bot3_high_vol_strategy(idxdf_daily, idxdf_1min, trade_date, gann_levels: Dict[str, float]):
-    """
-    HIGH_VOL (prev day HL/ATR > 1.4999) ke liye special Bot-3.
-    Yahan se bot3_high_vol_rule.py ka main engine call hoga.
-    """
-    prev_row = calculate_daily_atr_and_ratio(idxdf_daily)
-    ratio = float(prev_row["ratio"]) if prev_row is not None else None
-    print(f"[BOT3] ACTIVE for {trade_date}, prev_ratio={ratio}")
-
-    # 1-min -> 15-min
-    idx15 = (
-        idxdf_1min
-        .resample("15min")
-        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
-        .dropna()
-    )
-
-    # 15-min ATR(14) calculate karo
-    high_low = idx15["high"] - idx15["low"]
-    high_close = (idx15["high"] - idx15["close"].shift()).abs()
-    low_close = (idx15["low"] - idx15["close"].shift()).abs()
-    tr15 = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr15 = tr15.rolling(window=14).mean()
-
-    # 9:15 candle ka ATR approx: first non-NaN ATR value
-    atr_series = atr15.dropna()
-    atr15_at_915 = float(atr_series.iloc[0]) if not atr_series.empty else 0.0
-    print(f"[BOT3-ATR-15M] atr15_at_915={atr15_at_915:.2f}")
-
-    bot3_result = run_bot3_entry_engine(
-        idx1m=idxdf_1min,
-        idx15=idx15,
-        atr15_at_915=atr15_at_915,
-        gann_levels=gann_levels,
-    )
-
-    return {
-        "status": bot3_result.get("status", "BOT3_PENDING"),
-        "regime_ratio": ratio,
-        "details": bot3_result,
-    }
-
-
 # ===== SIMPLE LIVE HELPERS (ENTRY/EXIT) =====
-
 
 def get_live_option_ltp(api, token: str) -> float:
     """SmartAPI se current LTP lao (simple version)."""
@@ -2409,27 +2409,18 @@ def get_live_option_ltp(api, token: str) -> float:
 
 
 def run_live_loop_for_account(api, acc, date: str, expiry: str):
-    """
-    Simple LIVE loop:
-    - 9:15–15:30 ke beech har 60 sec me aaj tak ka index 1-min data fetch
-    - run_v2_orb_gann_backtest_logic se levels nikaalo
-    - entry condition aate hi 1 baar real order
-    - target/SL hit hote hi 1 baar exit
-    """
+
     trade_date = datetime.fromisoformat(date).date()
     lots = 1
-
-    entry_taken = False
-    exit_done = False
-    primary_side = None
-    primary_token = None
 
     print(f"[LIVE-LOOP] Started for {acc.name} date={date} expiry={expiry}")
 
     while True:
         now = datetime.now()
 
-        # -------- LIVE 9:30 HOOK / UNHOOK LOGIC --------
+        trading_state.check_date_reset()
+
+        # -------- HOOK LOGIC --------
         if (not bot_state.hook_detected
                 and now.time() >= HOOK_DETECTION_TIME):
             print("[HOOK] LIVE 9:30 hook detection start")
@@ -2439,22 +2430,20 @@ def run_live_loop_for_account(api, acc, date: str, expiry: str):
             bot_state.breakout_level = hook_info.get("breakout_level", 0.0)
             print("[HOOK] LIVE result:", hook_info)
 
-        # Agar UNHOOKED hai aur abhi breakout+1hr logic nahi dala,
-        # to filhaal koi entry mat lo.
         if bot_state.hook_detected and not bot_state.is_hooked:
             time.sleep(60)
             continue
 
-        # Market time window
+        # -------- Market Time Check --------
         if now.time() < time(9, 15):
-            # market open ka wait
             time.sleep(10)
             continue
+
         if now.time() > time(15, 30):
-            print(f"[LIVE-LOOP] Market closed, stopping for {acc.name}")
+            print(f"[LIVE-LOOP] Market closed for {acc.name}")
             break
 
-        # V1 request for today
+        # -------- Strategy Call --------
         v1req = VixRequest(
             candletype="NORMAL",
             open=0.0,
@@ -2476,14 +2465,10 @@ def run_live_loop_for_account(api, acc, date: str, expiry: str):
         strat = run_v2_orb_gann_backtest_logic(api=api, acc=acc, v1req=v1req)
 
         if strat.get("status") not in ("ok", "GAP_DAY"):
-            print(
-                f"[LIVE-LOOP] strategy status={strat.get('status')} msg={strat.get('message')}"
-            )
             time.sleep(30)
             continue
 
         if strat["status"] == "GAP_DAY":
-            print(f"[LIVE-LOOP] GAP DAY, skipping. msg={strat.get('message')}")
             break
 
         v1req = strat["v1req"]
@@ -2494,93 +2479,87 @@ def run_live_loop_for_account(api, acc, date: str, expiry: str):
         petoken = strat["petoken"]
         lots = v1req.lots or 1
 
-        # Agar abhi tak entry nahi li aur primary ready hai
-        if (not entry_taken) and primary.get("status") not in (
-            None,
-            "NOENTRY",
-            "NO_ENTRY",
-        ):
+        # -------- ENTRY --------
+        if primary.get("status") not in (None, "NOENTRY", "NO_ENTRY"):
+
             if not index_mode:
+
                 primary_token = cetoken if primary_side == "BUY" else petoken
-            else:
-                primary_token = ""
-
-            if not index_mode and primary_token:
                 qty = lots * 65
-                entryorder_res = place_market_order(
-                    api=api,
-                    tradingsymbol="NIFTY",
-                    symboltoken=primary_token,
-                    transactiontype=primary_side,  # BUY/SELL
-                    quantity=qty,
-                    exchange="NFO",
-                    product="MIS",  # intraday
-                    ordertype="MARKET",
-                    variety="NORMAL",
-                )
-                print(
-                    f"[LIVE-LOOP] ENTRY {primary_side} {qty} for {acc.name}: {entryorder_res}"
-                )
-                entry_taken = True
 
-            else:
-                print(
-                    f"[LIVE-LOOP] INDEX MODE, no option order for {acc.name}"
-                )
-                entry_taken = True  # index mode, aage exit check skip
+                if trading_state.can_enter(primary_side):
 
-        # Agar entry ho chuki hai, exit check karo
-        if entry_taken and not exit_done and (not index_mode) and primary_token:
+                    trading_state.mark_entry(
+                        primary_side,
+                        entry_price=0,
+                        symbol=primary_token
+                    )
+
+                    entry_res = place_option_buy(
+                        api=api,
+                        symbol=primary_token,
+                        token=primary_token,
+                        quantity=qty
+                    )
+
+                    print(f"[LIVE ENTRY] {primary_side} {qty}: {entry_res}")
+
+                    if not entry_res["status"]:
+                        trading_state.active_position = None
+
+        # -------- EXIT --------
+        if trading_state.active_position and not index_mode:
+
+            primary_token = trading_state.option_symbol
             ltp = get_live_option_ltp(api, primary_token)
-            if ltp <= 0:
-                time.sleep(10)
-                continue
 
-            if primary_side == "BUY":
-                tgt = v1req.buy.t4 or v1req.buy.t2 or 0.0
-                sl = v1req.buy.sl or 0.0
-                hit_target = tgt > 0 and ltp >= tgt
-                hit_sl = sl > 0 and ltp <= sl
-            else:
-                tgt = v1req.sell.t4 or v1req.sell.t2 or 0.0
-                sl = v1req.sell.sl or 0.0
-                hit_target = tgt > 0 and ltp <= tgt
-                hit_sl = sl > 0 and ltp >= sl
+            if ltp > 0:
 
-            print(
-                f"[LIVE-LOOP] LTP={ltp} tgt={tgt} sl={sl} "
-                f"side={primary_side} hit_tgt={hit_target} hit_sl={hit_sl}"
-            )
+                if trading_state.active_position == "BUY":
+                    tgt = v1req.buy.t4 or v1req.buy.t2 or 0.0
+                    sl = v1req.buy.sl or 0.0
+                    hit_target = tgt > 0 and ltp >= tgt
+                    hit_sl = sl > 0 and ltp <= sl
+                else:
+                    tgt = v1req.sell.t4 or v1req.sell.t2 or 0.0
+                    sl = v1req.sell.sl or 0.0
+                    hit_target = tgt > 0 and ltp <= tgt
+                    hit_sl = sl > 0 and ltp >= sl
 
-            if hit_target or hit_sl:
-                qty = lots * 65
-                exitorder_res = exit_position(
-                    api, primary_token, primary_side, qty)
                 print(
-                    f"[LIVE-LOOP] EXIT {primary_side} {qty} for {acc.name}: {exitorder_res}"
+                    f"[LIVE EXIT CHECK] LTP={ltp} tgt={tgt} sl={sl}"
                 )
-                exit_done = True
-                break
 
-        # Loop interval
+                if hit_target or hit_sl:
+
+                    qty = lots * 65
+
+                    exit_res = exit_position(
+                        api=api,
+                        token=primary_token,
+                        symbol=primary_token,
+                        side=trading_state.active_position,
+                        qty=qty
+                    )
+
+                    print(f"[LIVE EXIT] {exit_res}")
+
+                    if exit_res["status"]:
+                        trading_state.mark_exit()
+
         time.sleep(60)
 
     print(f"[LIVE-LOOP] Finished for {acc.name}")
 
 
 def do_live_trade_for_account(account_name: str, date: str, expiry: str):
-    """
-    AUTO LIVE: schedule / manual dono ke liye
-    - is account_name ka AccountConfig load karo
-    - smartlogin_for_account(acc) se SmartConnect banao
-    - run_v2_orb_gann_backtest_logic logic chalao
-    - place_market_order / exit_position se real orders
-    """
+
     print(
         f"[AUTO LIVE] Running for {account_name} date={date} expiry={expiry}")
 
     accounts = load_accounts()
     acc = next((a for a in accounts if a.name == account_name), None)
+
     if acc is None:
         print(f"[AUTO LIVE] Account {account_name} not found")
         return
@@ -2592,6 +2571,8 @@ def do_live_trade_for_account(account_name: str, date: str, expiry: str):
         return
 
     try:
+        trading_state.check_date_reset()
+
         v1req = VixRequest(
             candletype="NORMAL",
             open=0.0,
@@ -2613,12 +2594,11 @@ def do_live_trade_for_account(account_name: str, date: str, expiry: str):
         strat = run_v2_orb_gann_backtest_logic(api=api, acc=acc, v1req=v1req)
 
         if strat.get("status") not in ("ok", "GAP_DAY"):
-            print(
-                f"[AUTO LIVE] Strategy status={strat.get('status')} msg={strat.get('message')}")
+            print(f"[AUTO LIVE] Strategy status={strat.get('status')}")
             return
 
         if strat["status"] == "GAP_DAY":
-            print(f"[AUTO LIVE] GAP DAY: {strat.get('message')}")
+            print(f"[AUTO LIVE] GAP DAY")
             return
 
         v1req = strat["v1req"]
@@ -2630,37 +2610,46 @@ def do_live_trade_for_account(account_name: str, date: str, expiry: str):
         lots = v1req.lots or 1
 
         if primary.get("status") in (None, "NOENTRY", "NO_ENTRY"):
-            print(f"[AUTO LIVE] NO ENTRY for {account_name}")
+            print(f"[AUTO LIVE] NO ENTRY")
             return
 
-        if not index_mode:
-            primary_token = cetoken if primary_side == "BUY" else petoken
-        else:
-            primary_token = ""
+        if index_mode:
+            print("[AUTO LIVE] INDEX MODE — no option trade")
+            return
 
-        if not index_mode and primary_token:
-            qty = lots * 65
-            entryorder_res = place_market_order(
-                api=api,
-                tradingsymbol="NIFTY",
-                symboltoken=primary_token,
-                transactiontype=primary_side,
-                quantity=qty,
-                exchange="NFO",
-                product="MIS",
-                ordertype="MARKET",
-                variety="NORMAL",
+        primary_token = cetoken if primary_side == "BUY" else petoken
+        qty = lots * 65
+
+        # ---- SAFE ENTRY ----
+        if trading_state.can_enter(primary_side):
+
+            trading_state.mark_entry(
+                primary_side,
+                entry_price=0,
+                symbol=primary_token
             )
-            print(
-                f"[AUTO LIVE] ENTRY {primary_side} {qty} for {account_name}: {entryorder_res}")
 
-            exitorder_res = exit_position(
-                api, primary_token, primary_side, qty)
-            print(
-                f"[AUTO LIVE] EXIT {primary_side} {qty} for {account_name}: {exitorder_res}")
+            entry_res = place_option_buy(
+                api=api,
+                symbol=primary_token,
+                token=primary_token,
+                quantity=qty
+            )
 
+            print(f"[AUTO LIVE ENTRY] {primary_side} {qty}: {entry_res}")
+
+            if not entry_res["status"]:
+                trading_state.active_position = None
+                return
+
+        else:
             print(
-                f"[AUTO LIVE] INDEX MODE, no option order for {account_name}")
+                f"[AUTO LIVE] Direction already traded today: {primary_side}")
+            return
+
+        # NOTE:
+        # Exit yaha nahi karenge.
+        # Exit live loop ya SL/Target watcher karega.
 
     finally:
         try:
@@ -2769,22 +2758,17 @@ def manual_override(req: ManualOverrideRequest) -> Dict[str, Any]:
 
 @app.post("/v2/live-trade")
 def live_trade(req: LiveTradeSimpleRequest) -> Dict[str, Any]:
-    """
-    V2 ORB+Gann backtest-engine based LIVE trade:
-    - req.config = SimpleVixConfig (sirf date + expiry app se)
-    - Backend v2 backtest engine ka flow follow karega,
-      sirf last step par option side pe live orders place karega.
-    """
 
-    # 1) Account resolve
     accounts = load_accounts()
     acc = next((a for a in accounts if a.name == req.account_name), None)
+
     if acc is None:
         raise HTTPException(
-            status_code=400, detail=f"Account {req.account_name} not found")
+            status_code=400,
+            detail=f"Account {req.account_name} not found"
+        )
 
-    # SimpleVixConfig -> full VixRequest
-    simple = req.config  # SimpleVixConfig
+    simple = req.config
 
     v1req = VixRequest(
         candletype="NORMAL",
@@ -2804,15 +2788,17 @@ def live_trade(req: LiveTradeSimpleRequest) -> Dict[str, Any]:
         borestrictuntil=None,
     )
 
-    # 2) SmartAPI login
     try:
         api = smartlogin_for_account(acc)
     except Exception as e:
         raise HTTPException(
-            status_code=500, detail=f"SmartAPI login failed: {e}")
+            status_code=500,
+            detail=f"SmartAPI login failed: {e}"
+        )
 
     try:
-        # -------- PURE STRATEGY CALL --------
+        trading_state.check_date_reset()
+
         strat = run_v2_orb_gann_backtest_logic(api=api, acc=acc, v1req=v1req)
 
         if strat.get("status") not in ("ok", "GAP_DAY"):
@@ -2822,15 +2808,9 @@ def live_trade(req: LiveTradeSimpleRequest) -> Dict[str, Any]:
             return strat
 
         v1req = strat["v1req"]
-        boside = strat["boside"]
-        boside_up = strat["boside_up"]
         index_mode = strat["index_mode"]
-        buyresult = strat["buyresult"]
-        sellresult = strat["sellresult"]
         primary = strat["primary"]
         primary_side = strat["primary_side"]
-        cestrike = strat["cestrike"]
-        pestrike = strat["pestrike"]
         cetoken = strat["cetoken"]
         petoken = strat["petoken"]
         lots = v1req.lots or 1
@@ -2838,71 +2818,54 @@ def live_trade(req: LiveTradeSimpleRequest) -> Dict[str, Any]:
         if primary.get("status") in (None, "NOENTRY", "NO_ENTRY"):
             return {
                 "status": "STANDBY",
-                "message": f"No entry for direction {primary_side}",
-                "buy": buyresult,
-                "sell": sellresult,
-                "index_mode": index_mode,
+                "message": f"No entry for {primary_side}"
             }
 
-        # -------- LIVE ORDER EXECUTION --------
-        if not index_mode:
-            primary_token = cetoken if primary_side == "BUY" else petoken
-        else:
-            primary_token = ""
+        if index_mode:
+            return {
+                "status": "INDEX_MODE",
+                "message": "No option order in index mode"
+            }
 
-        entrytime_str = primary.get("entrytime")
-        exittime_str = primary.get("exittime") or primary.get("exittime")
-        entryprice = primary.get("entry") or primary.get("entryprice")
-        exitprice = primary.get("exit") or primary.get("exitprice")
-        pnl = primary.get("pnl")
-        reason = primary.get("status")
+        primary_token = cetoken if primary_side == "BUY" else petoken
+        qty = lots * 65
 
-        entryorder_res: Dict[str, Any] = {}
-        exitorder_res: Dict[str, Any] = {}
+        # -------- SAFE ENTRY CONTROL --------
+        if not trading_state.can_enter(primary_side):
+            return {
+                "status": "BLOCKED",
+                "message": f"{primary_side} already traded today"
+            }
 
-        if not index_mode and primary_token:
-            qty = lots * 65
-            entryorder_res = place_market_order(
-                api=api,
-                tradingsymbol="NIFTY",
-                symboltoken=primary_token,
-                transactiontype=primary_side,
-                quantity=qty,
-                exchange="NFO",
-                product="MIS",
-                ordertype="MARKET",
-                variety="NORMAL",
-            )
-            print(
-                f"[AUTO LIVE] ENTRY {primary_side} {qty} for {acc.name}: {entryorder_res}")
+        trading_state.mark_entry(
+            primary_side,
+            entry_price=0,
+            symbol=primary_token
+        )
 
-            exitorder_res = exit_position(
-                api, primary_token, primary_side, qty)
+        entryorder_res = place_option_buy(
+            api=api,
+            symbol=primary_token,
+            token=primary_token,
+            quantity=qty
+        )
 
-            print(
-                f"[AUTO LIVE] EXIT {primary_side} {qty} for {acc.name}: {exitorder_res}")
-
-            print(f"[AUTO LIVE] INDEX MODE, no option order for {acc.name}")
+        if not entryorder_res["status"]:
+            trading_state.active_position = None
+            return {
+                "status": "ENTRY_FAILED",
+                "details": entryorder_res
+            }
 
         return {
-            "status": "ok",
+            "status": "ENTRY_PLACED",
             "account": acc.name,
-            "boside": boside,
             "trade_side": primary_side,
-            "index_mode": index_mode,
-            "cestrike": cestrike,
-            "pestrike": pestrike,
-            "entrytime": entrytime_str,
-            "exittime": exittime_str,
-            "entryprice": entryprice,
-            "exitprice": exitprice,
-            "pnl": pnl,
-            "reason": reason,
-            "entryorder": entryorder_res,
-            "exitorder": exitorder_res,
-            "buy": buyresult,
-            "sell": sellresult,
+            "token": primary_token,
+            "qty": qty,
+            "entryorder": entryorder_res
         }
+
     finally:
         try:
             api.terminateSession(acc.clientid)

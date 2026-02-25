@@ -50,6 +50,9 @@ ORB_WINDOW_END = dtime(12, 30)
 # EOD exit time: 15:00
 EOD_EXIT_TIME = dtime(15, 0)
 
+# ==== BOT-3 SETTINGS ====
+BOT3_HIGH_VOL_THRESHOLD = 1.3  # prev_day_range / ATR
+
 # ========= HOOK DETECTION CONFIG =========
 HOOK_DETECTION_TIME = dtime(9, 30)
 HOOK_THRESHOLD_RS = 1.0
