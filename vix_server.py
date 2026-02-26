@@ -113,6 +113,27 @@ from order_engine import place_option_buy
 
 from logging.handlers import RotatingFileHandler
 
+# ---- Logging config: console + file ----
+LOG_FILE_PATH = Path("/home/ubuntu/logs/vix.log")
+LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),  # jo abhi console pe dikh raha hai
+        RotatingFileHandler(
+            LOG_FILE_PATH,
+            maxBytes=5_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        ),
+    ],
+)
+
+logger = logging.getLogger("vixbot")
+logger.info("==== VIX server startup ====")
+
 trading_state = TradingState()
 
 
@@ -271,11 +292,6 @@ def update_openapi():
             "status": "ERROR",
             "message": str(e),
         }
-
-
-# ---- Shared log file path ----
-LOG_FILE_PATH = Path("/home/ubuntu/logs/vix.log")
-LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 @app.get("/admin/poll")
