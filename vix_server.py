@@ -1,3 +1,4 @@
+from target_rules import get_atr_multiplier, classify_engine
 from prev_day_hl_breakout import check_breakout as check_breakout_local
 from borestriction_entry import (
     apply_default_bo_start_filter,
@@ -111,6 +112,7 @@ from trade_state_engine import TradingState
 from order_engine import place_option_buy
 
 trading_state = TradingState()
+
 
 # ===== Globals =====
 LAST_MANUAL_MONITOR_RUN: Optional[str] = None
@@ -282,7 +284,8 @@ def poll_status():
     }
 
 
-LOG_FILE_PATH = "vix.log"  # jahan tum uvicorn ka output log karaoge
+LOG_FILE_PATH = Path("/home/ubuntu/logs/vix.log")
+LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 @app.get("/admin/logs", response_class=PlainTextResponse)
@@ -290,16 +293,16 @@ async def get_logs(lines: int = 300):
     """
     Last N lines of log file as plain text.
     """
-    if not os.path.exists(LOG_FILE_PATH):
-        return f"Log file not found: {LOG_FILE_PATH}"
+    if not LOG_FILE_PATH.exists():
+        return PlainTextResponse(f"Log file not found: {LOG_FILE_PATH.name}")
 
     try:
-        with open(LOG_FILE_PATH, "r") as f:
+        with LOG_FILE_PATH.open("r", errors="ignore") as f:
             all_lines = f.readlines()
         tail = all_lines[-lines:]
-        return "".join(tail)
+        return PlainTextResponse("".join(tail))
     except Exception as e:
-        return f"Error reading logs: {e}"
+        return PlainTextResponse(f"Error reading logs: {e}")
 
 
 def monitor_manual_positions():
@@ -1474,12 +1477,20 @@ def run_v2_orb_gann_backtest_logic(
         v1req.buy.sl = cut_dec(levels["sell_entry"])
         v1req.sell.sl = cut_dec(levels["buy_entry"])
     else:
+        # ===== ATR_NORMAL WITH ENGINE-WISE MULTIPLIER =====
         atr14_local = half_gap.get("atr_14", 0.0) or half_gap.get("atr14", 0.0)
+
+        # Engine classify: MIDDAY / NORMAL / CHOTI / HIGH_VOL (915 & 10:00 ORB same bucket)
+        engine = classify_engine(orb_mode, is_choti_day, high_vol_orb)
+
+        # ATR multiplier rule per engine + hook status
+        atr_mult = get_atr_multiplier(
+            engine, bot_state.is_hooked, float(atr14_local))
 
         def pick_buy_t4_from_atr(base_entry: float) -> float:
             if atr14_local <= 0:
                 return cut_dec(levels["buy_t4"])
-            raw_target = base_entry + 2 * atr14_local
+            raw_target = base_entry + (atr14_local * atr_mult)
             candidates = [
                 levels["buy_t2"],
                 levels["buy_t25"],
@@ -1493,7 +1504,7 @@ def run_v2_orb_gann_backtest_logic(
         def pick_sell_t4_from_atr(base_entry: float) -> float:
             if atr14_local <= 0:
                 return cut_dec(levels["sell_t4"])
-            raw_target = base_entry - 2 * atr14_local
+            raw_target = base_entry - (atr14_local * atr_mult)
             candidates = [
                 levels["sell_t2"],
                 levels["sell_t25"],
@@ -1940,6 +1951,32 @@ def run_v2_orb_gann_backtest_logic(
         "exit_reason": primary_exit_reason,
         "pnl_points": primary_pnl,
     }
+    # -------- ATR DETAILS FOR JSON OUTPUT --------
+    # Safe defaults agar atr14_local / atr_mult / prev_ratio scope me na ho
+    try:
+        atr_15 = float(atr14_local)
+    except Exception:
+        atr_15 = float(half_gap.get("atr_14", 0.0) or 0.0)
+
+    atr_mult_used = float(atr_mult) if "atr_mult" in locals() else 1.0
+    engine_class = engine if "engine" in locals() else orb_mode
+
+    try:
+        prev_ratio_val = float(prev_ratio)
+    except Exception:
+        prev_ratio_val = 0.0
+
+    atr_details = {
+        "atr_15min": atr_15,
+        "atr_multiplier_used": atr_mult_used,
+        "engine_classified": engine_class,
+        "day_hook_status": bool(getattr(bot_state, "is_hooked", False)),
+        "prev_day_regime_ratio": prev_ratio_val,
+        "half_gap_detected": bool(is_half_gap),
+    }
+
+    # Nested ATR info inside trade_details as well (optional)
+    trade_details["atr_info"] = atr_details
 
     return {
         "status": "ok",
@@ -1961,6 +1998,7 @@ def run_v2_orb_gann_backtest_logic(
         "breakout_details": breakout_details,
         "gann_details": gann_details,
         "rule_tags": rule_tags,
+        "atr_info": atr_details,      # ← yeh line
         "trade_details": trade_details,
     }
 
