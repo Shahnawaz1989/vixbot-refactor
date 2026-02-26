@@ -86,7 +86,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from datetime import datetime, timedelta, time
+from datetime import datetime, date, time, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -112,6 +112,29 @@ from trade_state_engine import TradingState
 from order_engine import place_option_buy
 
 from logging.handlers import RotatingFileHandler
+
+# ---- Expiry helper for LIVE mode ----
+
+
+def pick_expiry_for_live(trade_date: date) -> str:
+    """
+    NIFTY weekly expiry Tuesday:
+    - Normal days: nearest coming Tuesday
+    - Agar aaj Tuesday (expiry day) hai: next Tuesday choose karo.
+    Returns YYYY-MM-DD.
+    """
+    weekday = trade_date.weekday()  # Monday=0, Tuesday=1, ... Sunday=6
+
+    # Pehle nearest coming Tuesday nikaalo
+    days_ahead = (1 - weekday) % 7  # 1 = Tuesday
+    expiry = trade_date + timedelta(days=days_ahead)
+
+    # Agar aaj hi Tuesday hai (expiry day), to next week ka Tuesday lo
+    if weekday == 1:
+        expiry = expiry + timedelta(days=7)
+
+    return expiry.strftime("%Y-%m-%d")
+
 
 # ---- Logging config: console + file ----
 LOG_FILE_PATH = Path("/home/ubuntu/logs/vix.log")
@@ -2878,6 +2901,10 @@ def live_trade(req: LiveTradeSimpleRequest) -> Dict[str, Any]:
 
     simple = req.config
 
+    # 🔹 LIVE ke liye expiry bot decide kare
+    trade_date = datetime.fromisoformat(simple.date).date()
+    auto_expiry = pick_expiry_for_live(trade_date)
+
     v1req = VixRequest(
         candletype="NORMAL",
         open=0.0,
@@ -2885,7 +2912,7 @@ def live_trade(req: LiveTradeSimpleRequest) -> Dict[str, Any]:
         buy=SideConfig(level=0.0),
         sell=SideConfig(level=0.0),
         date=simple.date,
-        expiry=simple.expiry,
+        expiry=auto_expiry,  # ⬅️ yahan bot-selected expiry
         boside=None,
         bostart=None,
         lots=1,
@@ -3120,6 +3147,9 @@ def schedule_live(req: LiveScheduleRequest):
             run_at=None,
         )
 
+    # 🔹 Yahin auto expiry decide karo (LIVE ke liye)
+    auto_expiry = pick_expiry_for_live(trade_date)
+
     # delete old job if exists
     try:
         scheduler.remove_job(schedule_id)
@@ -3137,7 +3167,7 @@ def schedule_live(req: LiveScheduleRequest):
 
     SCHEDULE_STORE[schedule_id] = {
         "date": req.date,
-        "expiry": req.expiry,
+        "expiry": auto_expiry,      # ⬅️ ab yahan bot-selected expiry
         "accounts": req.accounts,
         "mode": req.mode,
         "run_at": run_dt.isoformat(),

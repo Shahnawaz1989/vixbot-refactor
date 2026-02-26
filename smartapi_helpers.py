@@ -486,8 +486,15 @@ def getoptiontoken(strike: int, expiry: str, opttype: str) -> Optional[str]:
 
         strike_in_file_units = float(strike) * 100.0
         expirycode = _normalize_expiry_to_code(expiry)
+
+        # 🔹 GUARD: expiry ya opttype galat ho to yahin return
         if not expirycode:
-            print("getoptiontoken error: invalid expiry:", expiry)
+            print("getoptiontoken error: invalid expiry:",
+                  expiry, "opttype:", opttype)
+            return None
+        if opttype.upper() not in ("CE", "PE"):
+            print("getoptiontoken error: invalid opttype:",
+                  opttype, "expiry:", expiry)
             return None
 
         print(
