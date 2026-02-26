@@ -111,6 +111,8 @@ from bot3_high_vol_rule import run_bot3_high_vol_strategy
 from trade_state_engine import TradingState
 from order_engine import place_option_buy
 
+from logging.handlers import RotatingFileHandler
+
 trading_state = TradingState()
 
 
@@ -271,11 +273,16 @@ def update_openapi():
         }
 
 
+# ---- Shared log file path ----
+LOG_FILE_PATH = Path("/home/ubuntu/logs/vix.log")
+LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
 @app.get("/admin/poll")
 def poll_status():
     """
-    App ke liye light polling endpoint.
-    Manual monitor ka last run, time, etc. de sakte ho.
+    Light polling endpoint for app.
+    Can show server time, last manual monitor run, etc.
     """
     return {
         "status": "OK",
@@ -284,23 +291,23 @@ def poll_status():
     }
 
 
-LOG_FILE_PATH = Path("/home/ubuntu/logs/vix.log")
-LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-
 @app.get("/admin/logs", response_class=PlainTextResponse)
 async def get_logs(lines: int = 300):
     """
     Last N lines of log file as plain text.
     """
     if not LOG_FILE_PATH.exists():
-        return PlainTextResponse(f"Log file not found: {LOG_FILE_PATH.name}")
+        return PlainTextResponse("No logs yet.")
 
     try:
         with LOG_FILE_PATH.open("r", errors="ignore") as f:
             all_lines = f.readlines()
+
         tail = all_lines[-lines:]
-        return PlainTextResponse("".join(tail))
+        text = "".join(tail)
+        if not text:
+            return PlainTextResponse("No logs yet.")
+        return PlainTextResponse(text)
     except Exception as e:
         return PlainTextResponse(f"Error reading logs: {e}")
 
