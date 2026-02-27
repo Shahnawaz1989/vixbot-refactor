@@ -13,44 +13,60 @@ def map_gann_levels_to_v1req(
     high_vol_orb: bool,
 ) -> None:
     """
-    GANN MAPPING (HALF_GAP / ATR_NORMAL) + HIGH-VOL OPP ENTRY SHIFT.
+    Central GANN mapping:
 
-    - levels: calc_gann_levels_with_excel se aya dict
-    - trigger_side: "BUY" / "SELL"
-    - rule: "HALF_GAP" / "ATR_NORMAL"
-    - half_gap: detect_half_gap ka dict (atr_14 / atr14)
-    - high_vol_orb: ORB/BO high-vol flag
+    - Primary entry always *_t15 (BUY → buy_t15, SELL → sell_t15)
+    - Opp entry default *_entry
+    - HIGH-VOL ORB: sirf opp entry t15 pe shift (10AM/MIDDAY bots ke liye)
+    - SL: BUY SL = current SELL entry, SELL SL = current BUY entry
+    - HALF_GAP: fixed target rules
+    - ATR_NORMAL: ATR-based T4
     """
 
-    # -------- HIGH-VOL OPP ENTRY SHIFT --------
+    ts = (trigger_side or "").upper()
+    rl = (rule or "").upper()
+
+    # -------- Base entries --------
+    buy_primary_entry = levels.get("buy_t15", levels.get("buy_entry", 0.0))
+    sell_primary_entry = levels.get("sell_t15", levels.get("sell_entry", 0.0))
+
+    buy_opp_entry = levels.get("buy_entry", 0.0)
+    sell_opp_entry = levels.get("sell_entry", 0.0)
+
+    # -------- HIGH-VOL OPP ENTRY SHIFT (sirf opp leg) --------
     if high_vol_orb:
-        if trigger_side == "BUY":
-            if "sell_t15" in levels:
-                levels["sell_entry"] = levels["sell_t15"]
-        elif trigger_side == "SELL":
-            if "buy_t15" in levels:
-                levels["buy_entry"] = levels["buy_t15"]
+        if ts == "BUY":
+            # Primary BUY, opp SELL from sell_t15
+            sell_opp_entry = levels.get("sell_t15", sell_opp_entry)
+        elif ts == "SELL":
+            # Primary SELL, opp BUY from buy_t15
+            buy_opp_entry = levels.get("buy_t15", buy_opp_entry)
 
-    # -------- GANN MAPPING (HALF_GAP / ATR_NORMAL) --------
-    if rule == "HALF_GAP":
-        if trigger_side == "BUY":
-            v1req.buy.level = cut_dec(levels["buy_entry"])
-            v1req.buy.t4 = cut_dec(levels["buy_t2"])
+    # -------- HALF_GAP RULE --------
+    if rl == "HALF_GAP":
+        if ts == "BUY":
+            # Primary BUY from buy_t15
+            v1req.buy.level = cut_dec(buy_primary_entry)
+            v1req.buy.t4 = cut_dec(levels.get("buy_t2", 0.0))
 
-            v1req.sell.level = cut_dec(levels["sell_entry"])
-            v1req.sell.t4 = cut_dec(levels["sell_t15"])
-        else:
-            v1req.sell.level = cut_dec(levels["sell_entry"])
-            v1req.sell.t4 = cut_dec(levels["sell_t2"])
+            # Opp SELL from sell_entry / sell_opp_entry
+            v1req.sell.level = cut_dec(sell_opp_entry)
+            v1req.sell.t4 = cut_dec(levels.get("sell_t15", 0.0))
+        else:  # SELL trigger
+            # Primary SELL from sell_t15
+            v1req.sell.level = cut_dec(sell_primary_entry)
+            v1req.sell.t4 = cut_dec(levels.get("sell_t2", 0.0))
 
-            v1req.buy.level = cut_dec(levels["buy_entry"])
-            v1req.buy.t4 = cut_dec(levels["buy_t2"])
+            # Opp BUY from buy_entry / buy_opp_entry
+            v1req.buy.level = cut_dec(buy_opp_entry)
+            v1req.buy.t4 = cut_dec(levels.get("buy_t15", 0.0))
 
-        v1req.buy.sl = cut_dec(levels["sell_entry"])
-        v1req.sell.sl = cut_dec(levels["buy_entry"])
+        # SL: BUY SL = current SELL entry, SELL SL = current BUY entry
+        v1req.buy.sl = cut_dec(v1req.sell.level or 0.0)
+        v1req.sell.sl = cut_dec(v1req.buy.level or 0.0)
         return
 
-    # ATR_NORMAL mode
+    # -------- ATR_NORMAL MODE --------
     atr14_local = (
         half_gap.get("atr_14", 0.0)
         or half_gap.get("atr14", 0.0)
@@ -59,48 +75,53 @@ def map_gann_levels_to_v1req(
 
     def pick_buy_t4_from_atr(base_entry: float) -> float:
         if atr14_local <= 0:
-            return cut_dec(levels["buy_t4"])
+            return cut_dec(levels.get("buy_t4", 0.0))
         raw_target = base_entry + 2 * atr14_local
         candidates = [
-            levels["buy_t2"],
-            levels["buy_t25"],
-            levels["buy_t3"],
-            levels["buy_t35"],
-            levels["buy_t4"],
+            levels.get("buy_t2", 0.0),
+            levels.get("buy_t25", 0.0),
+            levels.get("buy_t3", 0.0),
+            levels.get("buy_t35", 0.0),
+            levels.get("buy_t4", 0.0),
         ]
         below = [x for x in candidates if x <= raw_target]
         return cut_dec(max(below) if below else max(candidates))
 
     def pick_sell_t4_from_atr(base_entry: float) -> float:
         if atr14_local <= 0:
-            return cut_dec(levels["sell_t4"])
+            return cut_dec(levels.get("sell_t4", 0.0))
         raw_target = base_entry - 2 * atr14_local
         candidates = [
-            levels["sell_t2"],
-            levels["sell_t25"],
-            levels["sell_t3"],
-            levels["sell_t35"],
-            levels["sell_t4"],
+            levels.get("sell_t2", 0.0),
+            levels.get("sell_t25", 0.0),
+            levels.get("sell_t3", 0.0),
+            levels.get("sell_t35", 0.0),
+            levels.get("sell_t4", 0.0),
         ]
         above = [x for x in candidates if x >= raw_target]
         return cut_dec(min(above) if above else min(candidates))
 
-    if trigger_side == "BUY":
-        v1req.buy.level = cut_dec(levels["buy_entry"])
-        v1req.buy.t2 = cut_dec(levels["buy_t2"])
+    if ts == "BUY":
+        # Primary BUY from buy_t15
+        v1req.buy.level = cut_dec(buy_primary_entry)
+        v1req.buy.t2 = cut_dec(levels.get("buy_t2", 0.0))
         v1req.buy.t4 = pick_buy_t4_from_atr(v1req.buy.level)
 
-        v1req.sell.level = cut_dec(levels["sell_entry"])
-        v1req.sell.t2 = cut_dec(levels["sell_t2"])
+        # Opp SELL from sell_opp_entry
+        v1req.sell.level = cut_dec(sell_opp_entry)
+        v1req.sell.t2 = cut_dec(levels.get("sell_t2", 0.0))
         v1req.sell.t4 = pick_sell_t4_from_atr(v1req.sell.level)
-    else:
-        v1req.sell.level = cut_dec(levels["sell_entry"])
-        v1req.sell.t2 = cut_dec(levels["sell_t2"])
+    else:  # SELL trigger
+        # Primary SELL from sell_t15
+        v1req.sell.level = cut_dec(sell_primary_entry)
+        v1req.sell.t2 = cut_dec(levels.get("sell_t2", 0.0))
         v1req.sell.t4 = pick_sell_t4_from_atr(v1req.sell.level)
 
-        v1req.buy.level = cut_dec(levels["buy_entry"])
-        v1req.buy.t2 = cut_dec(levels["buy_t2"])
+        # Opp BUY from buy_opp_entry
+        v1req.buy.level = cut_dec(buy_opp_entry)
+        v1req.buy.t2 = cut_dec(levels.get("buy_t2", 0.0))
         v1req.buy.t4 = pick_buy_t4_from_atr(v1req.buy.level)
 
-    v1req.buy.sl = cut_dec(levels["sell_entry"])
-    v1req.sell.sl = cut_dec(levels["buy_entry"])
+    # SL: BUY SL = current SELL entry, SELL SL = current BUY entry
+    v1req.buy.sl = cut_dec(v1req.sell.level or 0.0)
+    v1req.sell.sl = cut_dec(v1req.buy.level or 0.0)

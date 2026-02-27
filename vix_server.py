@@ -1477,109 +1477,29 @@ def run_v2_orb_gann_backtest_logic(
 
     # -------- GANN CMP (decimal ignore) --------
     cmp_for_gann = int(trigger_price)
+    orb_mode = "ORB_915"  # UI ke liye tag
 
-    # -------- RULE TAGGING --------
-    rule = "ATR_NORMAL"
-    if is_half_gap:
-        rule = "HALF_GAP"
-
-    # MORNING vs MID-DAY Excel
-    if orb_mode == "MIDDAY":
-        excel_path = GANNEXCELPATH_MIDDAY
-    else:
-        excel_path = GANN_EXCEL_PATH
+    excel_path = GANN_EXCEL_PATH
 
     try:
         levels = calc_gann_levels_with_excel(
             cmp_for_gann, side=trigger_side, excel_path=excel_path
         )
     except Exception as e:
-        return {"status": "error", "message": f"GANN Excel error: {e}"}
+        return {"status": "error", "message": f"GANN Excel error (915 ORB): {e}"}
 
-    # -------- HIGH-VOL OPP ENTRY SHIFT --------
-    if high_vol_orb:
-        if trigger_side == "BUY":
-            if "sell_t15" in levels:
-                levels["sell_entry"] = levels["sell_t15"]
-        elif trigger_side == "SELL":
-            if "buy_t15" in levels:
-                levels["buy_entry"] = levels["buy_t15"]
+    # -------- HIGH-VOL FLAG (simple) --------
+    high_vol_orb = False  # 915 bot me high-vol entry shift nahi
 
-    # -------- GANN MAPPING (HALF_GAP / ATR_NORMAL) --------
-    if rule == "HALF_GAP":
-        if trigger_side == "BUY":
-            v1req.buy.level = cut_dec(levels["buy_entry"])
-            v1req.buy.t4 = cut_dec(levels["buy_t2"])
-
-            v1req.sell.level = cut_dec(levels["sell_entry"])
-            v1req.sell.t4 = cut_dec(levels["sell_t15"])
-        else:
-            v1req.sell.level = cut_dec(levels["sell_entry"])
-            v1req.sell.t4 = cut_dec(levels["sell_t2"])
-
-            v1req.buy.level = cut_dec(levels["buy_entry"])
-            v1req.buy.t4 = cut_dec(levels["buy_t2"])
-
-        v1req.buy.sl = cut_dec(levels["sell_entry"])
-        v1req.sell.sl = cut_dec(levels["buy_entry"])
-    else:
-        # ===== ATR_NORMAL WITH ENGINE-WISE MULTIPLIER =====
-        atr14_local = half_gap.get("atr_14", 0.0) or half_gap.get("atr14", 0.0)
-
-        # Engine classify: MIDDAY / NORMAL / CHOTI / HIGH_VOL (915 & 10:00 ORB same bucket)
-        engine = classify_engine(orb_mode, is_choti_day, high_vol_orb)
-
-        # ATR multiplier rule per engine + hook status
-        atr_mult = get_atr_multiplier(
-            engine, bot_state.is_hooked, float(atr14_local))
-
-        def pick_buy_t4_from_atr(base_entry: float) -> float:
-            if atr14_local <= 0:
-                return cut_dec(levels["buy_t4"])
-            raw_target = base_entry + (atr14_local * atr_mult)
-            candidates = [
-                levels["buy_t2"],
-                levels["buy_t25"],
-                levels["buy_t3"],
-                levels["buy_t35"],
-                levels["buy_t4"],
-            ]
-            below = [x for x in candidates if x <= raw_target]
-            return cut_dec(max(below) if below else max(candidates))
-
-        def pick_sell_t4_from_atr(base_entry: float) -> float:
-            if atr14_local <= 0:
-                return cut_dec(levels["sell_t4"])
-            raw_target = base_entry - (atr14_local * atr_mult)
-            candidates = [
-                levels["sell_t2"],
-                levels["sell_t25"],
-                levels["sell_t3"],
-                levels["sell_t35"],
-                levels["sell_t4"],
-            ]
-            above = [x for x in candidates if x >= raw_target]
-            return cut_dec(min(above) if above else min(candidates))
-
-        if trigger_side == "BUY":
-            v1req.buy.level = cut_dec(levels["buy_entry"])
-            v1req.buy.t2 = cut_dec(levels["buy_t2"])
-            v1req.buy.t4 = pick_buy_t4_from_atr(v1req.buy.level)
-
-            v1req.sell.level = cut_dec(levels["sell_entry"])
-            v1req.sell.t2 = cut_dec(levels["sell_t2"])
-            v1req.sell.t4 = pick_sell_t4_from_atr(v1req.sell.level)
-        else:
-            v1req.sell.level = cut_dec(levels["sell_entry"])
-            v1req.sell.t2 = cut_dec(levels["sell_t2"])
-            v1req.sell.t4 = pick_sell_t4_from_atr(v1req.sell.level)
-
-            v1req.buy.level = cut_dec(levels["buy_entry"])
-            v1req.buy.t2 = cut_dec(levels["buy_t2"])
-            v1req.buy.t4 = pick_buy_t4_from_atr(v1req.buy.level)
-
-        v1req.buy.sl = cut_dec(levels["sell_entry"])
-        v1req.sell.sl = cut_dec(levels["buy_entry"])
+    # -------- CENTRAL GANN MAPPING (ATR_NORMAL ONLY) --------
+    map_gann_levels_to_v1req(
+        v1req=v1req,
+        levels=levels,
+        trigger_side=trigger_side,
+        rule="ATR_NORMAL",   # 915 ORB pe HALF_GAP day pe bot already exit ho chuka
+        half_gap=half_gap,
+        high_vol_orb=high_vol_orb,
+    )
 
     # -------- BOT-3 GANN LEVELS (raw) --------
     bot3_gann_levels = {
@@ -2169,7 +2089,6 @@ def run_915_orb_gann_backtest_logic(
     cmp_for_gann = int(trigger_price)
     orb_mode = "ORB_915"  # UI ke liye tag
 
-    # MORNING Excel hi use hoga
     excel_path = GANN_EXCEL_PATH
 
     try:
@@ -2180,58 +2099,17 @@ def run_915_orb_gann_backtest_logic(
         return {"status": "error", "message": f"GANN Excel error (915 ORB): {e}"}
 
     # -------- HIGH-VOL FLAG (simple) --------
-    high_vol_orb = False
+    high_vol_orb = False  # 915 bot me high-vol entry shift nahi
 
-    # -------- GANN MAPPING (ATR_NORMAL only) --------
-    atr14_local = half_gap.get("atr_14", 0.0) or half_gap.get("atr14", 0.0)
-
-    def pick_buy_t4_from_atr(base_entry: float) -> float:
-        if atr14_local <= 0:
-            return cut_dec(levels["buy_t4"])
-        raw_target = base_entry + 2 * atr14_local
-        candidates = [
-            levels["buy_t2"],
-            levels["buy_t25"],
-            levels["buy_t3"],
-            levels["buy_t35"],
-            levels["buy_t4"],
-        ]
-        below = [x for x in candidates if x <= raw_target]
-        return cut_dec(max(below) if below else max(candidates))
-
-    def pick_sell_t4_from_atr(base_entry: float) -> float:
-        if atr14_local <= 0:
-            return cut_dec(levels["sell_t4"])
-        raw_target = base_entry - 2 * atr14_local
-        candidates = [
-            levels["sell_t2"],
-            levels["sell_t25"],
-            levels["sell_t3"],
-            levels["sell_t35"],
-            levels["sell_t4"],
-        ]
-        above = [x for x in candidates if x >= raw_target]
-        return cut_dec(min(above) if above else min(candidates))
-
-    if trigger_side == "BUY":
-        v1req.buy.level = cut_dec(levels["buy_entry"])
-        v1req.buy.t2 = cut_dec(levels["buy_t2"])
-        v1req.buy.t4 = pick_buy_t4_from_atr(v1req.buy.level)
-
-        v1req.sell.level = cut_dec(levels["sell_entry"])
-        v1req.sell.t2 = cut_dec(levels["sell_t2"])
-        v1req.sell.t4 = pick_sell_t4_from_atr(v1req.sell.level)
-    else:
-        v1req.sell.level = cut_dec(levels["sell_entry"])
-        v1req.sell.t2 = cut_dec(levels["sell_t2"])
-        v1req.sell.t4 = pick_sell_t4_from_atr(v1req.sell.level)
-
-        v1req.buy.level = cut_dec(levels["buy_entry"])
-        v1req.buy.t2 = cut_dec(levels["buy_t2"])
-        v1req.buy.t4 = pick_buy_t4_from_atr(v1req.buy.level)
-
-    v1req.buy.sl = cut_dec(levels["sell_entry"])
-    v1req.sell.sl = cut_dec(levels["buy_entry"])
+    # -------- CENTRAL GANN MAPPING (ATR_NORMAL ONLY) --------
+    map_gann_levels_to_v1req(
+        v1req=v1req,
+        levels=levels,
+        trigger_side=trigger_side,
+        rule="ATR_NORMAL",   # 915 ORB pe HALF_GAP day pe bot already exit ho chuka
+        half_gap=half_gap,
+        high_vol_orb=high_vol_orb,
+    )
 
     # -------- ENTRY WINDOW + BOSTART (no CHOTI) --------
     trade_date2 = full_idxdf.index[0].date()
