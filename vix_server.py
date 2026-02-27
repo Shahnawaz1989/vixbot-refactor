@@ -1314,6 +1314,8 @@ def run_v2_orb_gann_backtest_logic(
     half_gap = detect_half_gap(api, nifty_idxdf, v1req.date)
     atr14 = float(half_gap.get("atr_14") or 0.0)
 
+    rule = "HALF_GAP" if half_gap.get("is_half_gap", False) else "ATR_NORMAL"
+
     # -------- ORB RANGE / ATR14 RATIO (10:00–10:15) --------
     orb_atr_info = detect_orb_atr_ratio(nifty_idxdf, atr14)
     high_vol_orb_range = orb_atr_info.get("is_high_vol", False)
@@ -1917,15 +1919,12 @@ def run_v2_orb_gann_backtest_logic(
         "exit_reason": primary_exit_reason,
         "pnl_points": primary_pnl,
     }
-    # -------- ATR DETAILS FOR JSON OUTPUT --------
-    # Safe defaults agar atr14_local / atr_mult / prev_ratio scope me na ho
-    try:
-        atr_15 = float(atr14_local)
-    except Exception:
-        atr_15 = float(half_gap.get("atr_14", 0.0) or 0.0)
 
-    atr_mult_used = float(atr_mult) if "atr_mult" in locals() else 1.0
-    engine_class = engine if "engine" in locals() else orb_mode
+    # -------- ATR DETAILS FOR JSON OUTPUT --------
+    atr_15 = float(atr14)  # upar half_gap se nikala hua
+
+    atr_mult_used = 1.0
+    engine_class = orb_mode
 
     try:
         prev_ratio_val = float(prev_ratio)
@@ -2277,6 +2276,20 @@ def run_915_orb_gann_backtest_logic(
             primary = {"status": "NOENTRY"}
             primary_side = "BUY"
 
+    # -------- ATR / GAP SUMMARY (for JSON) --------
+    atr_details: Dict[str, Any] = {
+        "atr_14_daily": float(atr14) if atr14 is not None else None,
+        "atr_15m": None,                  # 915 bot me nahi use ho raha
+        "atr_multiplier_used": 2.0,       # 915 ORB: fixed 2x ATR
+        "engine_classified": "ORB_915",
+        "day_hook_status": False,         # 915 bot: hook logic nahi
+        "hook_details": None,
+        "half_gap": {
+            "is_half_gap": bool(is_half_gap),
+            "half_gap_type": half_gap_type,
+        },
+    }
+
     # -------- SUMMARY FIELDS --------
     breakout_details: Dict[str, Any] = {
         "orb_mode": orb_mode,
@@ -2399,6 +2412,7 @@ def run_915_orb_gann_backtest_logic(
         "gann_details": gann_details,
         "rule_tags": rule_tags,
         "trade_details": trade_details,
+        "atr_details": atr_details,
     }
 
 
