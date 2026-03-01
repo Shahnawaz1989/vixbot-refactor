@@ -482,7 +482,10 @@ def smartlogin() -> Optional[SmartConnect]:
     Backtest ke liye use ho raha hai.
     """
     totp = pyotp.TOTP(TOTPSECRET).now()
-    api = SmartConnect(api_key=APIKEY)
+    api = SmartConnect(
+        api_key=APIKEY,
+        timeout=(10, 25)
+    )
     data = api.generateSession(CLIENTID, PASSWORD, totp)
     if not data.get("status"):
         print("SmartAPI login failed", data)
@@ -499,7 +502,10 @@ def smartlogin_for_account(acc: AccountConfig) -> SmartConnect:
     Live trading ke liye use hoga.
     """
     totp = pyotp.TOTP(acc.totpsecret).now()
-    api = SmartConnect(api_key=acc.apikey)
+    api = SmartConnect(
+        api_key=APIKEY,
+        timeout=(10, 25)
+    )
     data = api.generateSession(acc.clientid, acc.password, totp)
 
     if not data.get("status"):
